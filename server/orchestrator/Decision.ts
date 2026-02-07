@@ -151,20 +151,12 @@ export class DecisionEngine {
     obiDeep: number;
     execPoor: boolean;
   }): number {
-    const riskPerTradePercent = this.deps.getRiskPerTradePercent();
-    const maxLeverage = this.deps.getMaxLeverage();
-    const riskBudget = (input.availableBalance * riskPerTradePercent) / 100;
-    const probeRisk = riskBudget * 0.25;
+    const walletUsagePercent = this.deps.getRiskPerTradePercent(); // Actually walletUsagePercent from UI
+    const leverage = this.deps.getMaxLeverage();
 
-    const uncertaintyCapFromObi = Math.abs(input.obiDeep) < 0.2 ? 10 : 50;
-    const dynamicLevCap = Math.min(
-      maxLeverage,
-      50 / (Math.abs(input.deltaZ) + 0.5),
-      input.execPoor ? 20 : 100,
-      uncertaintyCapFromObi
-    );
-
-    const notional = probeRisk * Math.max(1, dynamicLevCap);
+    // Direct calculation: use walletUsagePercent of available balance with leverage
+    const usableBalance = (input.availableBalance * walletUsagePercent) / 100;
+    const notional = usableBalance * leverage;
     const qty = notional / input.expectedPrice;
 
     if (!Number.isFinite(qty) || qty <= 0) {
