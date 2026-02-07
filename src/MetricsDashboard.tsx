@@ -16,7 +16,6 @@ interface TimeAndSalesMetrics {
   bidHitAskLiftRatio: number;
   consecutiveBurst: ConsecutiveBurst;
   printsPerSecond: number;
-  avgLatencyMs?: number;
 }
 
 interface CvdMetrics {
@@ -186,13 +185,6 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ metrics, showLatency }) => {
             : 'None'}
         </div>
       </div>
-
-      {/* Optional latency */}
-      {showLatency && (
-        <div className="text-xs text-zinc-500">
-          Avg Latency: {formatNumber(timeAndSales.avgLatencyMs ?? 0, 2)} ms
-        </div>
-      )}
 
       {/* CVD multi‑timeframe section */}
       <div className="grid grid-cols-3 gap-2 mt-2 text-xs">

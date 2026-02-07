@@ -2,8 +2,8 @@ import { ExecutionEvent } from '../connectors/executionTypes';
 
 export interface OrchestratorMetricsInput {
   symbol: string;
-  event_time_ms: number;
-  latency_ms?: number | null;
+  canonical_time_ms?: number;
+  exchange_event_time_ms?: number | null;
   spread_pct?: number | null;
   prints_per_second?: number | null;
   best_bid?: number | null;
@@ -15,22 +15,38 @@ export interface OrchestratorMetricsInput {
   } | null;
 }
 
+export enum GateMode {
+  V1_NO_LATENCY = 'V1_NO_LATENCY',
+  V2_NETWORK_LATENCY = 'V2_NETWORK_LATENCY',
+}
+
+export interface GateConfig {
+  mode: GateMode;
+  maxSpreadPct: number;
+  minObiDeep: number;
+  v2?: {
+    maxNetworkLatencyMs: number;
+  };
+}
+
 export interface GateResult {
+  mode: GateMode;
   passed: boolean;
   reason: string | null;
-  latency_ms: number;
+  network_latency_ms: number | null;
   checks: {
     hasRequiredMetrics: boolean;
-    latencyOk: boolean;
     spreadOk: boolean;
     obiDeepOk: boolean;
+    networkLatencyOk: boolean | null;
   };
 }
 
 export interface MetricsEventEnvelope {
   kind: 'metrics';
   symbol: string;
-  event_time_ms: number;
+  canonical_time_ms: number;
+  exchange_event_time_ms: number | null;
   metrics: OrchestratorMetricsInput;
   gate: GateResult;
 }
@@ -105,7 +121,8 @@ export interface DecisionAction {
 
 export interface DecisionRecord {
   symbol: string;
-  event_time_ms: number;
+  canonical_time_ms: number;
+  exchange_event_time_ms: number | null;
   gate: GateResult;
   actions: DecisionAction[];
   stateSnapshot: {
@@ -119,9 +136,7 @@ export interface DecisionRecord {
 }
 
 export interface OrchestratorConfig {
-  maxLatencyMs: number;
-  maxSpreadPct: number;
-  minObiDeep: number;
+  gate: GateConfig;
   riskPerTradePercent: number;
   maxLeverage: number;
   cooldownMinMs: number;

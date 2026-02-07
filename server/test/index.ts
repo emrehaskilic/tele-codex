@@ -13,6 +13,7 @@ import * as LatencyTests from './Latency.test';
 import * as SequenceRuleTests from './SequenceRule.test';
 import * as ReconnectTests from './ReconnectContinuity.test';
 import * as LegacyTests from './LegacyCalculator.test';
+import * as GateTests from './Gate.test';
 
 // Minimal test harness: runs each runTests() and prints summary
 const testSuites: { name: string; fn: () => void }[] = [
@@ -26,6 +27,7 @@ const testSuites: { name: string; fn: () => void }[] = [
   { name: 'SequenceRule', fn: SequenceRuleTests.runTests },
   { name: 'ReconnectContinuity', fn: ReconnectTests.runTests },
   { name: 'LegacyCalculator', fn: LegacyTests.runTests },
+  { name: 'Gate', fn: GateTests.runTests },
 ];
 
 let total = 0;

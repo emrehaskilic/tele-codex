@@ -3,12 +3,13 @@ import { ExecutionConnector } from '../connectors/ExecutionConnector';
 import { ExecutionEvent } from '../connectors/executionTypes';
 import { SymbolActor } from './Actor';
 import { DecisionEngine } from './Decision';
-import { DataQualityGate } from './Gate';
+import { runGate } from './Gate';
 import { OrchestratorLogger } from './Logger';
 import {
   DecisionAction,
   DecisionRecord,
   ExecutionEventEnvelope,
+  GateMode,
   MetricsEventEnvelope,
   OrchestratorConfig,
   OrchestratorMetricsInput,
@@ -17,7 +18,6 @@ import {
 
 export class Orchestrator {
   private readonly actors = new Map<string, SymbolActor>();
-  private readonly gate: DataQualityGate;
   private readonly decisionEngine: DecisionEngine;
   private readonly logger: OrchestratorLogger;
   private readonly expectedByOrderId = new Map<string, { expectedPrice: number | null; sentAtMs: number; tag: 'entry' | 'add' | 'exit' }>();
@@ -27,7 +27,6 @@ export class Orchestrator {
     private readonly connector: ExecutionConnector,
     private readonly config: OrchestratorConfig
   ) {
-    this.gate = new DataQualityGate(config.maxLatencyMs, config.maxSpreadPct, config.minObiDeep);
     this.decisionEngine = new DecisionEngine({
       expectedPrice: (symbol, side, type, limitPrice) => this.connector.expectedPrice(symbol, side, type, limitPrice),
       riskPerTradePercent: config.riskPerTradePercent,
@@ -63,19 +62,47 @@ export class Orchestrator {
     const symbol = metrics.symbol.toUpperCase();
     this.connector.ensureSymbol(symbol);
 
-    const gate = this.gate.evaluate(metrics);
-    this.enqueueMetrics(symbol, metrics.event_time_ms, metrics, gate, true);
+    const canonical_time_ms = metrics.canonical_time_ms ?? Date.now();
+    const exchange_event_time_ms =
+      typeof metrics.exchange_event_time_ms === 'number' && Number.isFinite(metrics.exchange_event_time_ms)
+        ? metrics.exchange_event_time_ms
+        : null;
+
+    const gate = runGate(
+      {
+        canonical_time_ms,
+        exchange_event_time_ms,
+        metrics,
+      },
+      this.config.gate
+    );
+
+    this.enqueueMetrics(symbol, canonical_time_ms, exchange_event_time_ms, metrics, gate, true);
   }
 
-  ingestLoggedMetrics(logLine: { symbol: string; event_time_ms: number; metrics: OrchestratorMetricsInput; gate: MetricsEventEnvelope['gate'] }) {
+  ingestLoggedMetrics(logLine: {
+    symbol: string;
+    canonical_time_ms: number;
+    exchange_event_time_ms: number | null;
+    metrics: OrchestratorMetricsInput;
+    gate: MetricsEventEnvelope['gate'];
+  }) {
     const symbol = logLine.symbol.toUpperCase();
     this.connector.ensureSymbol(symbol);
-    this.enqueueMetrics(symbol, logLine.event_time_ms, logLine.metrics, logLine.gate, false);
+    this.enqueueMetrics(
+      symbol,
+      logLine.canonical_time_ms,
+      logLine.exchange_event_time_ms,
+      logLine.metrics,
+      logLine.gate,
+      false
+    );
   }
 
   private enqueueMetrics(
     symbol: string,
-    event_time_ms: number,
+    canonical_time_ms: number,
+    exchange_event_time_ms: number | null,
     metrics: OrchestratorMetricsInput,
     gate: MetricsEventEnvelope['gate'],
     shouldLog: boolean
@@ -83,14 +110,16 @@ export class Orchestrator {
     const envelope: MetricsEventEnvelope = {
       kind: 'metrics',
       symbol,
-      event_time_ms,
+      canonical_time_ms,
+      exchange_event_time_ms,
       metrics,
       gate,
     };
 
     if (shouldLog) {
-      this.logger.logMetrics(event_time_ms, {
-        event_time_ms,
+      this.logger.logMetrics(canonical_time_ms, {
+        canonical_time_ms,
+        exchange_event_time_ms,
         symbol,
         gate,
         metrics,
@@ -168,10 +197,11 @@ export class Orchestrator {
       onActions: async (actions) => {
         await this.executeActions(symbol, actions);
       },
-      onDecisionLogged: ({ symbol: s, event_time_ms, gate, actions, state }) => {
+      onDecisionLogged: ({ symbol: s, canonical_time_ms, exchange_event_time_ms, gate, actions, state }) => {
         const record: DecisionRecord = {
           symbol: s,
-          event_time_ms,
+          canonical_time_ms,
+          exchange_event_time_ms,
           gate,
           actions,
           stateSnapshot: {
@@ -184,7 +214,7 @@ export class Orchestrator {
           },
         };
         this.decisionLedger.push(record);
-        this.logger.logDecision(event_time_ms, record);
+        this.logger.logDecision(canonical_time_ms, record);
       },
       onExecutionLogged: (event, state) => {
         this.logger.logExecution(event.event_time_ms, {
@@ -282,6 +312,10 @@ export class Orchestrator {
 }
 
 export function createOrchestratorFromEnv(): Orchestrator {
+  const gateMode = process.env.ENABLE_GATE_V2 === 'true'
+    ? GateMode.V2_NETWORK_LATENCY
+    : GateMode.V1_NO_LATENCY;
+
   const connector = new ExecutionConnector({
     enabled: process.env.EXECUTION_ENABLED === '1',
     apiKey: process.env.BINANCE_TESTNET_API_KEY,
@@ -293,9 +327,14 @@ export function createOrchestratorFromEnv(): Orchestrator {
   });
 
   return new Orchestrator(connector, {
-    maxLatencyMs: Number(process.env.MAX_LATENCY_MS || 1000),
-    maxSpreadPct: Number(process.env.MAX_SPREAD_PCT || 0.08),
-    minObiDeep: Number(process.env.MIN_OBI_DEEP || 0.05),
+    gate: {
+      mode: gateMode,
+      maxSpreadPct: Number(process.env.MAX_SPREAD_PCT || 0.08),
+      minObiDeep: Number(process.env.MIN_OBI_DEEP || 0.05),
+      v2: {
+        maxNetworkLatencyMs: Number(process.env.MAX_NETWORK_LATENCY_MS || 1500),
+      },
+    },
     riskPerTradePercent: Number(process.env.RISK_PER_TRADE_PERCENT || 0.5),
     maxLeverage: Number(process.env.MAX_LEVERAGE || 25),
     cooldownMinMs: Number(process.env.COOLDOWN_MIN_MS || 2000),

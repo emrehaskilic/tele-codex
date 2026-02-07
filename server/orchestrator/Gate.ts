@@ -1,60 +1,66 @@
-import { GateResult, OrchestratorMetricsInput } from './types';
+import { GateConfig, GateMode, GateResult, OrchestratorMetricsInput } from './types';
 
-export class DataQualityGate {
-  constructor(
-    private readonly maxLatencyMs: number,
-    private readonly maxSpreadPct: number,
-    private readonly minObiDeep: number
-  ) {}
+export interface RunGateInput {
+  canonical_time_ms: number;
+  exchange_event_time_ms: number | null;
+  metrics: OrchestratorMetricsInput;
+}
 
-  evaluate(input: OrchestratorMetricsInput): GateResult {
-    const latency = input.latency_ms;
-    const spread = input.spread_pct;
-    const obiDeep = input.legacyMetrics?.obiDeep;
-    const deltaZ = input.legacyMetrics?.deltaZ;
-    const cvdSlope = input.legacyMetrics?.cvdSlope;
-    const printsPerSecond = input.prints_per_second;
+export function runGate(input: RunGateInput, cfg: GateConfig): GateResult {
+  const spread = input.metrics.spread_pct;
+  const obiDeep = input.metrics.legacyMetrics?.obiDeep;
+  const deltaZ = input.metrics.legacyMetrics?.deltaZ;
+  const cvdSlope = input.metrics.legacyMetrics?.cvdSlope;
+  const printsPerSecond = input.metrics.prints_per_second;
 
-    const hasRequiredMetrics = [latency, spread, obiDeep, deltaZ, cvdSlope, printsPerSecond]
-      .every((v) => typeof v === 'number' && Number.isFinite(v));
+  const hasRequiredMetrics = [spread, obiDeep, deltaZ, cvdSlope, printsPerSecond]
+    .every((v) => typeof v === 'number' && Number.isFinite(v));
 
-    if (!hasRequiredMetrics) {
-      return {
-        passed: false,
-        reason: 'missing_metrics',
-        latency_ms: typeof latency === 'number' && Number.isFinite(latency) ? latency : Number.NaN,
-        checks: {
-          hasRequiredMetrics: false,
-          latencyOk: false,
-          spreadOk: false,
-          obiDeepOk: false,
-        },
-      };
-    }
-
-    const latencyOk = (latency as number) <= this.maxLatencyMs;
-    const spreadOk = (spread as number) <= this.maxSpreadPct;
-    const obiDeepOk = Math.abs(obiDeep as number) >= this.minObiDeep;
-
-    let reason: string | null = null;
-    if (!latencyOk) {
-      reason = 'latency_too_high';
-    } else if (!spreadOk) {
-      reason = 'spread_too_wide';
-    } else if (!obiDeepOk) {
-      reason = 'obi_deep_too_low';
-    }
-
+  if (!hasRequiredMetrics) {
     return {
-      passed: reason === null,
-      reason,
-      latency_ms: latency as number,
+      mode: cfg.mode,
+      passed: false,
+      reason: 'missing_metrics',
+      network_latency_ms: null,
       checks: {
-        hasRequiredMetrics,
-        latencyOk,
-        spreadOk,
-        obiDeepOk,
+        hasRequiredMetrics: false,
+        spreadOk: false,
+        obiDeepOk: false,
+        networkLatencyOk: cfg.mode === GateMode.V2_NETWORK_LATENCY ? false : null,
       },
     };
   }
+
+  const spreadOk = (spread as number) <= cfg.maxSpreadPct;
+  const obiDeepOk = Math.abs(obiDeep as number) >= cfg.minObiDeep;
+
+  const networkLatencyMs = input.exchange_event_time_ms === null
+    ? null
+    : Math.max(0, input.canonical_time_ms - input.exchange_event_time_ms);
+
+  const networkLatencyOk = cfg.mode === GateMode.V2_NETWORK_LATENCY
+    ? networkLatencyMs !== null && networkLatencyMs <= (cfg.v2?.maxNetworkLatencyMs ?? Number.POSITIVE_INFINITY)
+    : null;
+
+  let reason: string | null = null;
+  if (!spreadOk) {
+    reason = 'spread_too_wide';
+  } else if (!obiDeepOk) {
+    reason = 'insufficient_liquidity';
+  } else if (cfg.mode === GateMode.V2_NETWORK_LATENCY && !networkLatencyOk) {
+    reason = 'network_latency_too_high';
+  }
+
+  return {
+    mode: cfg.mode,
+    passed: reason === null,
+    reason,
+    network_latency_ms: cfg.mode === GateMode.V2_NETWORK_LATENCY ? networkLatencyMs : null,
+    checks: {
+      hasRequiredMetrics,
+      spreadOk,
+      obiDeepOk,
+      networkLatencyOk,
+    },
+  };
 }

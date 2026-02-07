@@ -3,7 +3,8 @@ import * as crypto from 'crypto';
 import { Orchestrator } from './Orchestrator';
 
 type LogLine = {
-  event_time_ms: number;
+  canonical_time_ms?: number;
+  event_time_ms?: number;
   symbol: string;
   [k: string]: any;
 };
@@ -23,14 +24,24 @@ export class ReplayRunner {
     const execution = this.readJsonl(executionPath);
 
     const merged = [
-      ...metrics.map((m) => ({ kind: 'metrics' as const, event_time_ms: Number(m.event_time_ms || 0), payload: m })),
+      ...metrics.map((m) => ({
+        kind: 'metrics' as const,
+        event_time_ms: Number(m.canonical_time_ms || m.event_time_ms || 0),
+        payload: m,
+      })),
       ...execution.map((e) => ({ kind: 'execution' as const, event_time_ms: Number(e.event_time_ms || 0), payload: e })),
     ].sort((a, b) => a.event_time_ms - b.event_time_ms);
 
     for (const item of merged) {
       if (item.kind === 'metrics') {
         if (item.payload.metrics && item.payload.gate) {
-          this.orchestrator.ingestLoggedMetrics(item.payload as { symbol: string; event_time_ms: number; metrics: any; gate: any });
+          this.orchestrator.ingestLoggedMetrics({
+            symbol: item.payload.symbol,
+            canonical_time_ms: Number(item.payload.canonical_time_ms || item.payload.event_time_ms || 0),
+            exchange_event_time_ms: item.payload.exchange_event_time_ms ?? item.payload.metrics?.exchange_event_time_ms ?? null,
+            metrics: item.payload.metrics,
+            gate: item.payload.gate,
+          });
         } else {
           this.orchestrator.ingest(item.payload);
         }

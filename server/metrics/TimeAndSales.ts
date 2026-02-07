@@ -80,13 +80,6 @@ export interface TradeMetrics {
   };
 
   /**
-   * Average latency in milliseconds between the trade’s event time
-   * (reported by the exchange) and the receipt time (arrival on this
-   * server).  This metric is useful for diagnosing network delays.
-   */
-  avgLatencyMs: number;
-
-  /**
    * Prints per second.  Defined as tradeCount divided by the window
    * duration in seconds.  Provides a measure of trade intensity.
    */
@@ -118,9 +111,6 @@ export class TimeAndSales {
   private lastBurstSide: AggressiveSide | null = null;
   private lastBurstCount = 0;
 
-  // Track latencies (arrival − event timestamp) to compute average
-  private latencies: number[] = [];
-
   /**
    * Construct a new TimeAndSales aggregator.
    *
@@ -142,16 +132,9 @@ export class TimeAndSales {
     const arrival = Date.now();
     this.trades.push({ ...event, arrival });
 
-    // Record latency (arrival minus event timestamp), clamp at 0 to avoid negative values
-    const latency = arrival - event.timestamp;
-    this.latencies.push(Math.max(0, latency));
-
     // Purge expired trades based on the event timestamp (not receipt time)
     const cutoff = event.timestamp - this.windowMs;
     this.trades = this.trades.filter(t => t.timestamp >= cutoff);
-
-    // Purge old latencies to match the trade window
-    this.latencies = this.latencies.slice(Math.max(0, this.latencies.length - this.trades.length));
 
     // Update consecutive burst detection.  If the side matches the
     // previous trade’s side we increment the burst counter; otherwise
@@ -225,9 +208,6 @@ export class TimeAndSales {
       count: this.lastBurstCount,
     };
 
-    // Compute average latency
-    const avgLatencyMs = this.latencies.length > 0 ? this.latencies.reduce((a, b) => a + b, 0) / this.latencies.length : 0;
-
     const printsPerSecond = this.windowMs > 0 ? tradeCount / (this.windowMs / 1000) : 0;
 
     return {
@@ -239,7 +219,6 @@ export class TimeAndSales {
       largeTrades: largeCount,
       bidHitAskLiftRatio: ratio,
       consecutiveBurst: burst,
-      avgLatencyMs,
       printsPerSecond,
     };
   }

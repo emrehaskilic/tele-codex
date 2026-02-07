@@ -14,7 +14,8 @@ export interface SymbolActorDeps {
   onActions: (actions: DecisionAction[]) => Promise<void>;
   onDecisionLogged: (record: {
     symbol: string;
-    event_time_ms: number;
+    canonical_time_ms: number;
+    exchange_event_time_ms: number | null;
     gate: MetricsEventEnvelope['gate'];
     actions: DecisionAction[];
     state: SymbolState;
@@ -86,7 +87,7 @@ export class SymbolActor {
 
     const actions = this.deps.decisionEngine.evaluate({
       symbol: envelope.symbol,
-      event_time_ms: envelope.event_time_ms,
+      event_time_ms: envelope.canonical_time_ms,
       gate: envelope.gate,
       metrics: envelope.metrics,
       state: this.state,
@@ -94,7 +95,8 @@ export class SymbolActor {
 
     this.deps.onDecisionLogged({
       symbol: envelope.symbol,
-      event_time_ms: envelope.event_time_ms,
+      canonical_time_ms: envelope.canonical_time_ms,
+      exchange_event_time_ms: envelope.exchange_event_time_ms,
       gate: envelope.gate,
       actions,
       state: this.snapshotState(),

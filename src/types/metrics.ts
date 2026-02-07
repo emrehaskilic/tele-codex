@@ -63,7 +63,6 @@ export interface TimeAndSalesMetrics {
     count: number;
   };
   printsPerSecond: number;
-  avgLatencyMs?: number;
 }
 
 /**

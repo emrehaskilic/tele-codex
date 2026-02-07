@@ -165,12 +165,6 @@ const RightStatsPanel: React.FC<RightStatsPanelProps> = ({ metrics, showLatency 
             {timeAndSales.consecutiveBurst.side ? `${timeAndSales.consecutiveBurst.side} ×${timeAndSales.consecutiveBurst.count}` : 'None'}
           </span>
         </div>
-        {showLatency && timeAndSales.avgLatencyMs !== undefined && (
-          <div className="flex justify-between text-zinc-500 mt-1">
-            <span>Avg Latency</span>
-            <span className="font-mono">{formatNum(timeAndSales.avgLatencyMs, 2)} ms</span>
-          </div>
-        )}
       </div>
 
       {/* Multi‑timeframe CVD */}

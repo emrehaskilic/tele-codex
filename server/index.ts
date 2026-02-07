@@ -566,10 +566,11 @@ function broadcastMetrics(
     }
 
     if (eventTimeMs > 0) {
+        const canonicalTimeMs = Date.now();
         orchestrator.ingest({
             symbol: s,
-            event_time_ms: eventTimeMs,
-            latency_ms: tasMetrics.avgLatencyMs,
+            canonical_time_ms: canonicalTimeMs,
+            exchange_event_time_ms: eventTimeMs,
             spread_pct: spreadPct,
             prints_per_second: tasMetrics.printsPerSecond,
             best_bid: bestBidPx,
