@@ -58,7 +58,8 @@ export class SymbolActor {
     if (!this.processing) {
       this.processing = true;
       setImmediate(() => {
-        this.processQueue().catch(() => {
+        this.processQueue().catch((e) => {
+          console.error(`[ACTOR ${this.deps.symbol}] processQueue error:`, e);
           this.processing = false;
         });
       });

@@ -332,6 +332,8 @@ export class Orchestrator {
     this.executionSymbols.clear();
     for (const s of newSet) {
       this.executionSymbols.add(s);
+      // Pre-create actor so it receives sync events
+      this.getActor(s);
     }
 
     this.connector.setSymbols(normalized);
@@ -348,6 +350,7 @@ export class Orchestrator {
       symbol,
       decisionEngine: this.decisionEngine,
       onActions: async (actions) => {
+        console.log(`[ORCHESTRATOR] onActions called for ${symbol}:`, actions.map(a => a.type).join(', '));
         await this.executeActions(symbol, actions);
       },
       onDecisionLogged: ({ symbol: s, canonical_time_ms, exchange_event_time_ms, gate, actions, state }) => {
@@ -448,20 +451,26 @@ export class Orchestrator {
       if ((action.type === 'ENTRY_PROBE' || action.type === 'ADD_POSITION') && action.side && action.quantity && action.quantity > 0) {
         const tag = action.type === 'ENTRY_PROBE' ? 'entry' : 'add';
         const clientOrderId = this.clientOrderId(tag, symbol, action.event_time_ms);
-        const response = await this.connector.placeOrder({
-          symbol,
-          side: action.side,
-          type: 'MARKET',
-          quantity: action.quantity,
-          reduceOnly: false,
-          clientOrderId,
-        });
+        console.log(`[EXEC] Placing order: ${symbol} ${action.side} ${action.quantity} @ MARKET`);
+        try {
+          const response = await this.connector.placeOrder({
+            symbol,
+            side: action.side,
+            type: 'MARKET',
+            quantity: action.quantity,
+            reduceOnly: false,
+            clientOrderId,
+          });
+          console.log(`[EXEC] Order placed: orderId=${response.orderId}`);
 
-        this.expectedByOrderId.set(response.orderId, {
-          expectedPrice: action.expectedPrice || null,
-          sentAtMs: action.event_time_ms,
-          tag,
-        });
+          this.expectedByOrderId.set(response.orderId, {
+            expectedPrice: action.expectedPrice || null,
+            sentAtMs: action.event_time_ms,
+            tag,
+          });
+        } catch (e: any) {
+          console.error(`[EXEC] Order FAILED:`, e.message || e);
+        }
       }
     }
   }

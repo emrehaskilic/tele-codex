@@ -8,6 +8,9 @@
  * 4. Observability-first (Detailed /health and JSON logs).
  */
 
+import * as dotenv from 'dotenv';
+dotenv.config();
+
 import express, { Request, Response } from 'express';
 import { createServer } from 'http';
 import { WebSocket, WebSocketServer } from 'ws';

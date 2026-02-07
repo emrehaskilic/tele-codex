@@ -263,7 +263,9 @@ export class ExecutionConnector {
   }
 
   async syncState(): Promise<void> {
+    console.log('[CONNECTOR] syncState called, symbols:', Array.from(this.symbols));
     if (!this.apiKey || !this.apiSecret || this.symbols.size === 0) {
+      console.log('[CONNECTOR] syncState skipped - missing creds or no symbols');
       return;
     }
 
@@ -653,18 +655,32 @@ export class ExecutionConnector {
     query.set('signature', signature);
 
     const url = `${this.config.restBaseUrl}${path}?${query.toString()}`;
-    const response = await fetch(url, {
-      method,
-      headers: {
-        'X-MBX-APIKEY': apiKey,
-      },
-    });
 
-    if (!response.ok) {
-      const errBody = await response.text();
-      throw new Error(`Binance ${method} ${path} failed (${response.status}): ${errBody}`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: {
+          'X-MBX-APIKEY': apiKey,
+        },
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errBody = await response.text();
+        throw new Error(`Binance ${method} ${path} failed (${response.status}): ${errBody}`);
+      }
+
+      return await response.json();
+    } catch (e: any) {
+      if (e.name === 'AbortError') {
+        throw new Error(`Binance ${method} ${path} request timed out after 10s`);
+      }
+      throw e;
+    } finally {
+      clearTimeout(timeout);
     }
-
-    return response.json();
   }
 }
