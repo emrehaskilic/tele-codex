@@ -34,6 +34,7 @@ import {
     getTopLevels,
 } from './metrics/OrderbookManager';
 import { LegacyCalculator } from './metrics/LegacyCalculator';
+import { createOrchestratorFromEnv } from './orchestrator/Orchestrator';
 
 // =============================================================================
 // Configuration
@@ -117,6 +118,7 @@ const lastOpenInterest = new Map<string, OpenInterestMetrics>();
 const lastFunding = new Map<string, FundingMetrics>();
 const oiMonitors = new Map<string, OpenInterestMonitor>();
 const fundingMonitors = new Map<string, FundingMonitor>();
+const orchestrator = createOrchestratorFromEnv();
 
 // Cached Exchange Info
 let exchangeInfoCache: { data: any; timestamp: number } | null = null;
@@ -409,7 +411,7 @@ function handleMsg(raw: Buffer) {
                 const abs = getAbs(s);
                 const leg = getLegacy(s);
                 const absVal = absorptionResult.get(s) ?? 0;
-                broadcastMetrics(s, ob, tas, cvd, absVal, leg, 'depth');
+                broadcastMetrics(s, ob, tas, cvd, absVal, leg, d.E || d.T || 0, 'depth');
 
                 // Debug: BOOK_TOP event (every 200th apply to avoid spam)
                 if (ob.stats.applied % 200 === 0) {
@@ -454,7 +456,7 @@ function handleMsg(raw: Buffer) {
         absorptionResult.set(s, absVal);
 
         // Broadcast
-        broadcastMetrics(s, ob, tas, cvd, absVal, leg);
+        broadcastMetrics(s, ob, tas, cvd, absVal, leg, t);
     }
 }
 
@@ -465,6 +467,7 @@ function broadcastMetrics(
     cvd: CvdCalculator,
     absVal: number,
     leg: LegacyCalculator,
+    eventTimeMs: number,
     reason: 'depth' | 'trade' = 'trade'
 ) {
     const THROTTLE_MS = 250; // 4Hz max per symbol
@@ -480,6 +483,7 @@ function broadcastMetrics(
     }
 
     const cvdM = cvd.computeMetrics();
+    const tasMetrics = tas.computeMetrics();
     // Calculate OBI/Legacy if Orderbook has data (bids and asks exist)
     // This allows metrics to continue displaying during brief resyncs
     const hasBookData = ob.bids.size > 0 && ob.asks.size > 0;
@@ -487,13 +491,19 @@ function broadcastMetrics(
 
     // Top of book
     const { bids, asks } = getTopLevels(ob, 20);
-    const mid = (bestBid(ob) && bestAsk(ob)) ? (bestBid(ob)! + bestAsk(ob)!) / 2 : null;
+    const bestBidPx = bestBid(ob);
+    const bestAskPx = bestAsk(ob);
+    const mid = (bestBidPx && bestAskPx) ? (bestBidPx + bestAskPx) / 2 : null;
+    const spreadPct = (bestBidPx && bestAskPx && mid && mid > 0)
+        ? ((bestAskPx - bestBidPx) / mid) * 100
+        : null;
 
     const payload = {
         type: 'metrics',
         symbol: s,
+        event_time_ms: eventTimeMs,
         state: ob.uiState,
-        timeAndSales: tas.computeMetrics(),
+        timeAndSales: tasMetrics,
         cvd: {
             tf1m: cvdM.find(x => x.timeframe === '1m') || { cvd: 0, delta: 0, exhaustion: false },
             tf5m: cvdM.find(x => x.timeframe === '5m') || { cvd: 0, delta: 0, exhaustion: false },
@@ -504,7 +514,11 @@ function broadcastMetrics(
         openInterest: leg ? leg.getOpenInterestMetrics() : null,
         funding: lastFunding.get(s) || null,
         legacyMetrics: legacyM, // Null if unseeded
-        bids, asks, midPrice: mid,
+        bids, asks,
+        bestBid: bestBidPx,
+        bestAsk: bestAskPx,
+        spreadPct,
+        midPrice: mid,
         lastUpdateId: ob.lastUpdateId
     };
 
@@ -548,6 +562,23 @@ function broadcastMetrics(
             obiWeighted: legacyM?.obiWeighted ?? null,
             obiDeep: legacyM?.obiDeep ?? null,
             bookLevels: { bids: ob.bids.size, asks: ob.asks.size }
+        });
+    }
+
+    if (eventTimeMs > 0) {
+        orchestrator.ingest({
+            symbol: s,
+            event_time_ms: eventTimeMs,
+            latency_ms: tasMetrics.avgLatencyMs,
+            spread_pct: spreadPct,
+            prints_per_second: tasMetrics.printsPerSecond,
+            best_bid: bestBidPx,
+            best_ask: bestAskPx,
+            legacyMetrics: legacyM ? {
+                obiDeep: legacyM.obiDeep,
+                deltaZ: legacyM.deltaZ,
+                cvdSlope: legacyM.cvdSlope
+            } : null
         });
     }
 }
@@ -678,3 +709,6 @@ setInterval(() => {
 }, 10000);
 
 server.listen(PORT, HOST, () => log('SERVER_UP', { port: PORT, host: HOST }));
+orchestrator.start().catch((e) => {
+    log('ORCHESTRATOR_START_ERROR', { error: e.message });
+});
