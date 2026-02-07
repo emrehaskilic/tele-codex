@@ -14,7 +14,8 @@ interface ExecutionStatus {
     symbols: string[];
     lastError: string | null;
   };
-  selectedSymbol: string | null;
+  selectedSymbol?: string | null; // Legacy
+  selectedSymbols: string[]; // New
   settings: {
     initialBalanceUsdt: number;
     walletUsagePercent: number;
@@ -33,6 +34,12 @@ interface ExecutionStatus {
     entryPrice: number;
     leverage: number;
   } | null;
+  openPositions?: Record<string, {
+    side: 'LONG' | 'SHORT';
+    size: number;
+    entryPrice: number;
+    leverage: number;
+  }>;
 }
 
 const defaultExecutionStatus: ExecutionStatus = {
@@ -44,6 +51,7 @@ const defaultExecutionStatus: ExecutionStatus = {
     lastError: null,
   },
   selectedSymbol: null,
+  selectedSymbols: [],
   settings: {
     initialBalanceUsdt: 1000,
     walletUsagePercent: 10,
@@ -57,12 +65,13 @@ const defaultExecutionStatus: ExecutionStatus = {
     totalPnl: 0,
   },
   openPosition: null,
+  openPositions: {},
 };
 
 const formatNum = (n: number, d = 2) => n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 
 export const Dashboard: React.FC = () => {
-  const [selectedPair, setSelectedPair] = useState<string>('BTCUSDT');
+  const [selectedPairs, setSelectedPairs] = useState<string[]>(['BTCUSDT']);
   const [availablePairs, setAvailablePairs] = useState<string[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [isDropdownOpen, setDropdownOpen] = useState(false);
@@ -72,13 +81,15 @@ export const Dashboard: React.FC = () => {
   const [apiSecret, setApiSecret] = useState('');
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
+  // Settings inputs - initialize with defaults, only update from server on first load/explicit sync
   const [initialBalanceUsdt, setInitialBalanceUsdt] = useState<number>(1000);
   const [walletUsagePercent, setWalletUsagePercent] = useState<number>(10);
   const [leverage, setLeverage] = useState<number>(10);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
 
   const [executionStatus, setExecutionStatus] = useState<ExecutionStatus>(defaultExecutionStatus);
 
-  const activeSymbols = useMemo(() => [selectedPair], [selectedPair]);
+  const activeSymbols = useMemo(() => selectedPairs, [selectedPairs]);
   const marketData: MetricsState = useTelemetrySocket(activeSymbols);
 
   const hostname = window.location.hostname;
@@ -91,8 +102,8 @@ export const Dashboard: React.FC = () => {
         const data = await res.json();
         const pairs = Array.isArray(data?.symbols) ? data.symbols : [];
         setAvailablePairs(pairs);
-        if (pairs.length > 0 && !pairs.includes(selectedPair)) {
-          setSelectedPair(pairs[0]);
+        if (pairs.length > 0 && selectedPairs.length === 0) {
+          setSelectedPairs([pairs[0]]);
         }
       } catch {
         setAvailablePairs(['BTCUSDT', 'ETHUSDT', 'SOLUSDT']);
@@ -110,9 +121,26 @@ export const Dashboard: React.FC = () => {
         const res = await fetch(`${proxyUrl}/api/execution/status`);
         const data = (await res.json()) as ExecutionStatus;
         setExecutionStatus(data);
-        setInitialBalanceUsdt(data.settings.initialBalanceUsdt);
-        setWalletUsagePercent(data.settings.walletUsagePercent);
-        setLeverage(data.settings.leverage);
+
+        // Sync local settings only if not yet loaded (prevents overwrite while typing)
+        if (!settingsLoaded && data.settings) {
+          setInitialBalanceUsdt(data.settings.initialBalanceUsdt);
+          setWalletUsagePercent(data.settings.walletUsagePercent);
+          setLeverage(data.settings.leverage);
+          setSettingsLoaded(true);
+
+          // Also sync selected symbols if server has them
+          if (data.selectedSymbols && data.selectedSymbols.length > 0) {
+            // Merge with local? Or overwrite locally?
+            // Overwrite locally since server is source of truth on load
+            const serverSyms = data.selectedSymbols.filter(s => s && s.length > 0);
+            if (serverSyms.length > 0) {
+              setSelectedPairs(serverSyms);
+            }
+          } else if (data.selectedSymbol) {
+            setSelectedPairs([data.selectedSymbol]);
+          }
+        }
       } catch {
         // no-op: keep last known state
       }
@@ -124,21 +152,85 @@ export const Dashboard: React.FC = () => {
   }, [proxyUrl]);
 
   useEffect(() => {
-    const syncSelectedSymbol = async () => {
+    const syncSelectedSymbols = async () => {
       try {
         await fetch(`${proxyUrl}/api/execution/symbol`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ symbol: selectedPair }),
+          body: JSON.stringify({ symbols: selectedPairs }),
         });
       } catch {
         // ignore and retry on next change
       }
     };
-    syncSelectedSymbol();
-  }, [proxyUrl, selectedPair]);
+    // Debounce slightly to avoid spamming while selecting multiple?
+    const timer = setTimeout(syncSelectedSymbols, 500);
+    return () => clearTimeout(timer);
+  }, [proxyUrl, selectedPairs]);
 
   const filteredPairs = availablePairs.filter((p) => p.includes(searchTerm.toUpperCase()));
+
+  const togglePair = (pair: string) => {
+    if (selectedPairs.includes(pair)) {
+      setSelectedPairs(selectedPairs.filter(p => p !== pair));
+    } else {
+      setSelectedPairs([...selectedPairs, pair]);
+    }
+  };
+
+  const startExecution = async () => {
+    setConnectionError(null);
+    try {
+      // 1. Connect
+      if (executionStatus.connection.state !== 'CONNECTED') {
+        const res = await fetch(`${proxyUrl}/api/execution/connect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ apiKey, apiSecret }),
+        });
+        if (!res.ok) {
+          const d = await res.json();
+          throw new Error(d.error || 'connect_failed');
+        }
+      }
+
+      // 2. Enable
+      const res2 = await fetch(`${proxyUrl}/api/execution/enabled`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      });
+      const data = await res2.json();
+      if (res2.ok) {
+        setExecutionStatus(data.status);
+      } else {
+        throw new Error(data.error || 'enable_failed');
+      }
+    } catch (e: any) {
+      setConnectionError(e.message || 'start_failed');
+    }
+  };
+
+  const killSwitch = async () => {
+    setConnectionError(null);
+    try {
+      // 1. Disable
+      await fetch(`${proxyUrl}/api/execution/enabled`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+
+      // 2. Disconnect (triggers cancel all)
+      const res = await fetch(`${proxyUrl}/api/execution/disconnect`, {
+        method: 'POST'
+      });
+      const data = await res.json();
+      setExecutionStatus(data.status);
+    } catch (e: any) {
+      setConnectionError(e.message || 'kill_failed');
+    }
+  };
 
   const connectTestnet = async () => {
     setConnectionError(null);
@@ -199,8 +291,8 @@ export const Dashboard: React.FC = () => {
   const statusColor = executionStatus.connection.state === 'CONNECTED'
     ? 'text-green-400'
     : executionStatus.connection.state === 'ERROR'
-    ? 'text-red-400'
-    : 'text-zinc-400';
+      ? 'text-red-400'
+      : 'text-zinc-400';
 
   return (
     <div className="min-h-screen bg-[#09090b] text-zinc-200 font-sans p-6">
@@ -236,10 +328,28 @@ export const Dashboard: React.FC = () => {
               onChange={(e) => setApiSecret(e.target.value)}
               className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
             />
-            <div className="flex gap-2">
-              <button onClick={connectTestnet} className="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded text-xs font-semibold">Connect Testnet</button>
-              <button onClick={disconnectTestnet} className="px-3 py-2 bg-zinc-700 hover:bg-zinc-600 rounded text-xs font-semibold">Disconnect</button>
+
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={startExecution}
+                className="px-3 py-3 bg-green-600 hover:bg-green-500 rounded text-sm font-bold text-white shadow-lg shadow-green-900/20 transition-all active:scale-95"
+                disabled={executionStatus.connection.executionEnabled}
+              >
+                START EXECUTION
+              </button>
+              <button
+                onClick={killSwitch}
+                className="px-3 py-3 bg-red-600 hover:bg-red-500 rounded text-sm font-bold text-white shadow-lg shadow-red-900/20 transition-all active:scale-95 animate-pulse"
+              >
+                KILL SWITCH
+              </button>
             </div>
+
+            <div className="flex gap-2 opacity-50 text-xs">
+              <button onClick={connectTestnet} className="hover:underline">Manual Connect</button>
+              <button onClick={disconnectTestnet} className="hover:underline">Manual Disconnect</button>
+            </div>
+
             <div className="text-xs">
               Status: <span className={statusColor} title={executionStatus.connection.lastError || ''}>{executionStatus.connection.state}</span>
             </div>
@@ -256,15 +366,25 @@ export const Dashboard: React.FC = () => {
           </div>
 
           <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 space-y-3">
-            <h2 className="text-sm font-semibold text-zinc-300">Pair Selection</h2>
+            <h2 className="text-sm font-semibold text-zinc-300">Pair Selection (Multi)</h2>
             <p className="text-[11px] text-zinc-500">Pair list source: TESTNET futures exchangeInfo. Data stream: MAINNET metrics.</p>
             <button
               onClick={() => setDropdownOpen((v) => !v)}
               className="w-full flex items-center justify-between bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-sm"
             >
-              <span>{isLoadingPairs ? 'Loading testnet pairs...' : selectedPair}</span>
+              <span>{isLoadingPairs ? 'Loading...' : `${selectedPairs.length} pairs selected`}</span>
               <span>▾</span>
             </button>
+
+            <div className="flex flex-wrap gap-1 mt-2 mb-2">
+              {selectedPairs.map(p => (
+                <span key={p} className="text-xs px-2 py-1 bg-blue-900/30 text-blue-300 rounded flex items-center gap-1 border border-blue-900/50">
+                  {p}
+                  <button onClick={() => togglePair(p)} className="hover:text-white">×</button>
+                </span>
+              ))}
+            </div>
+
             {isDropdownOpen && !isLoadingPairs && (
               <div className="border border-zinc-800 rounded bg-zinc-950 p-2 space-y-2">
                 <input
@@ -275,18 +395,19 @@ export const Dashboard: React.FC = () => {
                   className="w-full bg-black border border-zinc-800 rounded px-2 py-1 text-xs"
                 />
                 <div className="max-h-56 overflow-y-auto space-y-1">
-                  {filteredPairs.map((pair) => (
-                    <button
-                      key={pair}
-                      onClick={() => {
-                        setSelectedPair(pair);
-                        setDropdownOpen(false);
-                      }}
-                      className={`w-full text-left px-2 py-1 rounded text-xs ${pair === selectedPair ? 'bg-blue-900/40 text-blue-300' : 'hover:bg-zinc-800 text-zinc-400'}`}
-                    >
-                      {pair}
-                    </button>
-                  ))}
+                  {filteredPairs.map((pair) => {
+                    const isSelected = selectedPairs.includes(pair);
+                    return (
+                      <button
+                        key={pair}
+                        onClick={() => togglePair(pair)}
+                        className={`w-full text-left px-2 py-1 rounded text-xs flex justify-between ${isSelected ? 'bg-blue-900/40 text-blue-300' : 'hover:bg-zinc-800 text-zinc-400'}`}
+                      >
+                        <span>{pair}</span>
+                        {isSelected && <span>✓</span>}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             )}

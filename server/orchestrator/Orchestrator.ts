@@ -22,7 +22,7 @@ export class Orchestrator {
   private readonly logger: OrchestratorLogger;
   private readonly expectedByOrderId = new Map<string, { expectedPrice: number | null; sentAtMs: number; tag: 'entry' | 'add' | 'exit' }>();
   private readonly decisionLedger: DecisionRecord[] = [];
-  private executionSymbol: string | null = null;
+  private readonly executionSymbols = new Set<string>();
   private capitalSettings = {
     initialBalanceUsdt: 1000,
     walletUsagePercent: 10,
@@ -71,7 +71,7 @@ export class Orchestrator {
 
   ingest(metrics: OrchestratorMetricsInput) {
     const symbol = metrics.symbol.toUpperCase();
-    if (this.executionSymbol && symbol !== this.executionSymbol) {
+    if (this.executionSymbols.size > 0 && !this.executionSymbols.has(symbol)) {
       return;
     }
     this.connector.ensureSymbol(symbol);
@@ -102,7 +102,7 @@ export class Orchestrator {
     gate: MetricsEventEnvelope['gate'];
   }) {
     const symbol = logLine.symbol.toUpperCase();
-    if (this.executionSymbol && symbol !== this.executionSymbol) {
+    if (this.executionSymbols.size > 0 && !this.executionSymbols.has(symbol)) {
       return;
     }
     this.connector.ensureSymbol(symbol);
@@ -148,7 +148,7 @@ export class Orchestrator {
 
   ingestExecutionReplay(execution: ExecutionEvent) {
     const symbol = execution.symbol.toUpperCase();
-    if (this.executionSymbol && symbol !== this.executionSymbol) {
+    if (this.executionSymbols.size > 0 && !this.executionSymbols.has(symbol)) {
       return;
     }
     this.connector.ensureSymbol(symbol);
@@ -207,30 +207,64 @@ export class Orchestrator {
 
   getExecutionStatus() {
     const connectorStatus = this.connector.getStatus();
-    const selectedSymbol = this.executionSymbol;
-    const state = selectedSymbol ? this.actors.get(selectedSymbol)?.state || null : null;
-    const realized = selectedSymbol ? (this.realizedPnlBySymbol.get(selectedSymbol) || 0) : 0;
-    const unrealized = state?.position?.unrealizedPnlPct || 0;
+    const selectedSymbols = Array.from(this.executionSymbols);
+    const primarySymbol = selectedSymbols[0] || null; // Legacy support
+
+    // Aggregated PnL
+    let totalRealized = 0;
+    let totalUnrealized = 0;
+    let totalWallet = 0;
+    let totalAvailable = 0;
+
+    // We can get wallet balance from any actor state if available, or just use the first valid one
+    // Ideally, wallet balance is account-wide.
+    let walletFound = false;
+
+    if (this.executionSymbols.size > 0) {
+      for (const sym of this.executionSymbols) {
+        const state = this.actors.get(sym)?.state;
+        if (state) {
+          if (!walletFound) {
+            totalWallet = state.walletBalance;
+            totalAvailable = state.availableBalance;
+            walletFound = true;
+          }
+          totalRealized += (this.realizedPnlBySymbol.get(sym) || 0);
+          totalUnrealized += (state.position?.unrealizedPnlPct || 0);
+        }
+      }
+    }
 
     return {
       connection: connectorStatus,
-      selectedSymbol,
+      selectedSymbol: primarySymbol, // Legacy
+      selectedSymbols, // New
       settings: this.capitalSettings,
       wallet: {
-        totalWalletUsdt: state?.walletBalance || 0,
-        availableBalanceUsdt: state?.availableBalance || 0,
-        realizedPnl: realized,
-        unrealizedPnl: unrealized,
-        totalPnl: realized + unrealized,
+        totalWalletUsdt: totalWallet,
+        availableBalanceUsdt: totalAvailable,
+        realizedPnl: totalRealized,
+        unrealizedPnl: totalUnrealized,
+        totalPnl: totalRealized + totalUnrealized,
       },
-      openPosition: state?.position
-        ? {
-            side: state.position.side,
-            size: state.position.qty,
-            entryPrice: state.position.entryPrice,
-            leverage: this.capitalSettings.leverage,
-          }
-        : null,
+      openPosition: primarySymbol ? (this.actors.get(primarySymbol)?.state?.position ? {
+        side: this.actors.get(primarySymbol)!.state.position!.side,
+        size: this.actors.get(primarySymbol)!.state.position!.qty,
+        entryPrice: this.actors.get(primarySymbol)!.state.position!.entryPrice,
+        leverage: this.capitalSettings.leverage,
+      } : null) : null,
+      openPositions: selectedSymbols.reduce((acc, sym) => {
+        const pos = this.actors.get(sym)?.state.position;
+        if (pos) {
+          acc[sym] = {
+            side: pos.side,
+            size: pos.qty,
+            entryPrice: pos.entryPrice,
+            leverage: this.capitalSettings.leverage
+          };
+        }
+        return acc;
+      }, {} as any)
     };
   }
 
@@ -257,6 +291,24 @@ export class Orchestrator {
   }
 
   async disconnectExecution() {
+    for (const symbol of this.executionSymbols) {
+      try {
+        await this.connector.cancelAllOpenOrders(symbol);
+      } catch (e: any) {
+        // Best effort
+        this.logger.logExecution(Date.now(), {
+          event_time_ms: Date.now(),
+          symbol,
+          event: {
+            type: 'ERROR',
+            symbol,
+            event_time_ms: Date.now(),
+            error: 'Disconnect cancel failed: ' + (e.message || String(e))
+          } as any, // Cast to any because ERROR type might not be fully defined in ExecutionTypes or similar
+          state: this.actors.get(symbol)?.state as any
+        });
+      }
+    }
     await this.connector.disconnect();
   }
 
@@ -264,21 +316,25 @@ export class Orchestrator {
     return this.connector.fetchTestnetFuturesPairs();
   }
 
-  async setExecutionSymbol(symbol: string) {
-    const normalized = symbol.toUpperCase();
-    if (this.executionSymbol === normalized) {
-      return;
+  async setExecutionSymbols(symbols: string[]) {
+    const normalized = symbols.map(s => s.toUpperCase());
+    const newSet = new Set(normalized);
+
+    // Identify removed symbols
+    for (const existing of this.executionSymbols) {
+      if (!newSet.has(existing)) {
+        await this.connector.cancelAllOpenOrders(existing);
+        this.actors.delete(existing);
+        this.realizedPnlBySymbol.delete(existing);
+      }
     }
 
-    const previousSymbol = this.executionSymbol;
-    if (previousSymbol) {
-      await this.connector.cancelAllOpenOrders(previousSymbol);
-      this.actors.delete(previousSymbol);
-      this.realizedPnlBySymbol.delete(previousSymbol);
+    this.executionSymbols.clear();
+    for (const s of newSet) {
+      this.executionSymbols.add(s);
     }
 
-    this.executionSymbol = normalized;
-    this.connector.setSymbols([normalized]);
+    this.connector.setSymbols(normalized);
     await this.connector.syncState();
   }
 

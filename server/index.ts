@@ -721,11 +721,18 @@ app.post('/api/execution/enabled', async (req, res) => {
 app.post('/api/execution/symbol', async (req, res) => {
     try {
         const symbol = String(req.body?.symbol || '').toUpperCase();
-        if (!symbol) {
-            res.status(400).json({ error: 'symbol is required' });
+        let symbols = Array.isArray(req.body?.symbols) ? req.body.symbols.map((s: any) => String(s).toUpperCase()) : null;
+
+        if (!symbols && symbol) {
+            symbols = [symbol];
+        }
+
+        if (!symbols || symbols.length === 0) {
+            res.status(400).json({ error: 'symbol or symbols required' });
             return;
         }
-        await orchestrator.setExecutionSymbol(symbol);
+
+        await orchestrator.setExecutionSymbols(symbols);
         res.json({ ok: true, status: orchestrator.getExecutionStatus() });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e.message || 'execution_symbol_set_failed' });
