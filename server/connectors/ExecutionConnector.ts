@@ -4,6 +4,7 @@ import {
   CancelOrderRequest,
   ExecutionConnectorConfig,
   ExecutionEvent,
+  MarginType,
   OpenOrdersSnapshotEvent,
   OrderUpdateEvent,
   PlaceOrderRequest,
@@ -13,6 +14,7 @@ import {
 
 type ExecutionListener = (event: ExecutionEvent) => void;
 type StatusListener = (status: ExecutionConnectorStatus) => void;
+type DebugListener = (event: ExecutionDebugEvent) => void;
 
 type UserDataMessage = {
   e?: string;
@@ -20,6 +22,22 @@ type UserDataMessage = {
   o?: any;
   a?: any;
 };
+
+interface SymbolRules {
+  minQty: number;
+  maxQty: number;
+  stepSize: number;
+  priceTickSize: number;
+  minNotional: number;
+}
+
+interface SignedRequestOptions {
+  path: string;
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  params?: Record<string, string | number | boolean | undefined | null>;
+  requiresAuth: boolean;
+  orderAttemptId?: string;
+}
 
 export type ExecutionConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
 
@@ -29,28 +47,56 @@ export interface ExecutionConnectorStatus {
   hasCredentials: boolean;
   symbols: string[];
   lastError: string | null;
+  ready: boolean;
+  readyReason: string | null;
+  serverTimeOffsetMs: number;
+  dualSidePosition: boolean | null;
   updatedAtMs: number;
+}
+
+export interface ExecutionDebugEvent {
+  channel: 'execution';
+  type:
+    | 'order_attempt'
+    | 'order_result'
+    | 'order_error'
+    | 'request_debug'
+    | 'request_error'
+    | 'why_not_sent'
+    | 'readiness';
+  order_attempt_id?: string;
+  decision_id?: string;
+  symbol?: string;
+  ts: number;
+  payload: any;
 }
 
 export class ExecutionConnector {
   private readonly config: ExecutionConnectorConfig;
   private readonly listeners = new Set<ExecutionListener>();
   private readonly statusListeners = new Set<StatusListener>();
+  private readonly debugListeners = new Set<DebugListener>();
   private readonly symbols = new Set<string>();
   private readonly quotes = new Map<string, TestnetQuote>();
+  private readonly readyBySymbol = new Map<string, { ready: boolean; reason: string | null }>();
+  private readonly symbolRules = new Map<string, SymbolRules>();
 
   private userWs: WebSocket | null = null;
   private marketWs: WebSocket | null = null;
   private listenKey: string | null = null;
   private keepAliveTimer: NodeJS.Timeout | null = null;
+  private serverTimeSyncTimer: NodeJS.Timeout | null = null;
   private reconnectingUserStream = false;
-  private lastSequenceEventMs = 0;
 
   private apiKey: string | undefined;
   private apiSecret: string | undefined;
   private executionEnabled: boolean;
   private state: ExecutionConnectionState = 'DISCONNECTED';
   private lastError: string | null = null;
+
+  private serverTimeOffsetMs = 0;
+  private dualSidePosition: boolean | null = null;
+  private exchangeInfoLoaded = false;
 
   constructor(config: ExecutionConnectorConfig) {
     this.config = config;
@@ -70,13 +116,23 @@ export class ExecutionConnector {
     return () => this.statusListeners.delete(listener);
   }
 
+  onDebug(listener: DebugListener) {
+    this.debugListeners.add(listener);
+    return () => this.debugListeners.delete(listener);
+  }
+
   getStatus(): ExecutionConnectorStatus {
+    const readiness = this.aggregateReadiness();
     return {
       state: this.state,
       executionEnabled: this.executionEnabled,
       hasCredentials: Boolean(this.apiKey && this.apiSecret),
       symbols: Array.from(this.symbols),
       lastError: this.lastError,
+      ready: readiness.ready,
+      readyReason: readiness.reason,
+      serverTimeOffsetMs: this.serverTimeOffsetMs,
+      dualSidePosition: this.dualSidePosition,
       updatedAtMs: Date.now(),
     };
   }
@@ -90,16 +146,14 @@ export class ExecutionConnector {
     this.emitStatus();
   }
 
+  isConnected(): boolean {
+    return this.state === 'CONNECTED';
+  }
+
   setCredentials(apiKey: string, apiSecret: string) {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
     this.lastError = null;
-    this.emitStatus();
-  }
-
-  clearCredentials() {
-    this.apiKey = undefined;
-    this.apiSecret = undefined;
     this.emitStatus();
   }
 
@@ -114,6 +168,7 @@ export class ExecutionConnector {
 
   setSymbols(symbols: string[]) {
     this.symbols.clear();
+    this.readyBySymbol.clear();
     for (const symbol of symbols) {
       this.symbols.add(symbol.toUpperCase());
     }
@@ -123,6 +178,14 @@ export class ExecutionConnector {
 
   getQuote(symbol: string): TestnetQuote | null {
     return this.quotes.get(symbol.toUpperCase()) || null;
+  }
+
+  async start() {
+    if (this.apiKey && this.apiSecret) {
+      await this.connect();
+    } else {
+      this.emitStatus();
+    }
   }
 
   async connect(): Promise<void> {
@@ -139,9 +202,20 @@ export class ExecutionConnector {
     this.emitStatus();
 
     try {
+      await this.syncServerTimeOffset();
+      await this.loadExchangeInfo();
+      await this.loadPositionMode();
       await this.startUserStream();
       this.reconnectMarketData();
       await this.syncState();
+      await this.ensureReadyForSymbols();
+
+      this.serverTimeSyncTimer = setInterval(() => {
+        this.syncServerTimeOffset().catch(() => {
+          // status remains last known; request errors are logged
+        });
+      }, 30_000);
+
       this.state = 'CONNECTED';
       this.lastError = null;
       this.emitStatus();
@@ -153,18 +227,18 @@ export class ExecutionConnector {
     }
   }
 
-  async start() {
-    if (this.apiKey && this.apiSecret) {
-      await this.connect();
-    } else {
-      this.emitStatus();
-    }
+  async disconnect(): Promise<void> {
+    await this.stop();
   }
 
   async stop() {
     if (this.keepAliveTimer) {
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
+    }
+    if (this.serverTimeSyncTimer) {
+      clearInterval(this.serverTimeSyncTimer);
+      this.serverTimeSyncTimer = null;
     }
     if (this.userWs) {
       this.userWs.close();
@@ -188,10 +262,6 @@ export class ExecutionConnector {
     this.emitStatus();
   }
 
-  async disconnect(): Promise<void> {
-    await this.stop();
-  }
-
   expectedPrice(symbol: string, side: 'BUY' | 'SELL', orderType: 'MARKET' | 'LIMIT', limitPrice?: number): number | null {
     if (orderType === 'LIMIT') {
       return typeof limitPrice === 'number' ? limitPrice : null;
@@ -203,31 +273,136 @@ export class ExecutionConnector {
     return side === 'BUY' ? quote.bestAsk : quote.bestBid;
   }
 
-  async placeOrder(request: PlaceOrderRequest): Promise<{ orderId: string }> {
+  async placeOrder(
+    request: PlaceOrderRequest,
+    context?: { decisionId?: string; orderAttemptId?: string }
+  ): Promise<{ orderId: string }> {
+    const orderAttemptId = context?.orderAttemptId || randomUUID();
+
     if (!this.executionEnabled) {
+      this.emitDebug({
+        channel: 'execution',
+        type: 'why_not_sent',
+        order_attempt_id: orderAttemptId,
+        decision_id: context?.decisionId,
+        symbol: request.symbol,
+        ts: Date.now(),
+        payload: { why_not_sent: 'disabled' },
+      });
       return { orderId: `dry-${request.clientOrderId}` };
     }
 
-    const params: Record<string, string | number | boolean> = {
-      symbol: request.symbol,
+    if (!this.apiKey || !this.apiSecret) {
+      this.emitDebug({
+        channel: 'execution',
+        type: 'why_not_sent',
+        order_attempt_id: orderAttemptId,
+        decision_id: context?.decisionId,
+        symbol: request.symbol,
+        ts: Date.now(),
+        payload: { why_not_sent: 'missing_keys' },
+      });
+      throw new Error('Execution keys are missing');
+    }
+
+    if (!this.isConnected()) {
+      this.emitDebug({
+        channel: 'execution',
+        type: 'why_not_sent',
+        order_attempt_id: orderAttemptId,
+        decision_id: context?.decisionId,
+        symbol: request.symbol,
+        ts: Date.now(),
+        payload: { why_not_sent: 'not_connected', state: this.state },
+      });
+      throw new Error('Execution connector is not connected');
+    }
+
+    const symbol = request.symbol.toUpperCase();
+    const readiness = this.readyBySymbol.get(symbol);
+    if (!readiness || !readiness.ready) {
+      this.emitDebug({
+        channel: 'execution',
+        type: 'why_not_sent',
+        order_attempt_id: orderAttemptId,
+        decision_id: context?.decisionId,
+        symbol,
+        ts: Date.now(),
+        payload: { why_not_sent: 'execution_not_ready', reason: readiness?.reason || 'missing_symbol_readiness' },
+      });
+      throw new Error(readiness?.reason || 'Execution not ready for symbol');
+    }
+
+    const qty = await this.normalizeQuantity(symbol, request.side, request.quantity);
+    const positionSide = this.resolvePositionSide(request);
+
+    const params: Record<string, string | number | boolean | undefined> = {
+      symbol,
       side: request.side,
-      type: request.type,
-      quantity: request.quantity,
+      type: 'MARKET',
+      quantity: qty,
       newClientOrderId: request.clientOrderId,
-      recvWindow: this.config.recvWindowMs,
-      timestamp: Date.now(),
+      reduceOnly: request.reduceOnly ? true : undefined,
+      positionSide,
+      recvWindow: Math.trunc(this.config.recvWindowMs || 5000),
     };
 
-    if (request.type === 'LIMIT') {
-      params.price = request.price || 0;
-      params.timeInForce = 'GTC';
-    }
-    if (request.reduceOnly) {
-      params.reduceOnly = true;
-    }
+    this.emitDebug({
+      channel: 'execution',
+      type: 'order_attempt',
+      order_attempt_id: orderAttemptId,
+      decision_id: context?.decisionId,
+      symbol,
+      ts: Date.now(),
+      payload: {
+        method: 'POST',
+        baseUrl: this.config.restBaseUrl,
+        path: '/fapi/v1/order',
+        params,
+      },
+    });
 
-    const response = await this.signedRequest('/fapi/v1/order', 'POST', params);
-    return { orderId: String(response.orderId || request.clientOrderId || randomUUID()) };
+    try {
+      const response = await this.signedRequest({
+        path: '/fapi/v1/order',
+        method: 'POST',
+        params,
+        requiresAuth: true,
+        orderAttemptId,
+      });
+
+      this.emitDebug({
+        channel: 'execution',
+        type: 'order_result',
+        order_attempt_id: orderAttemptId,
+        decision_id: context?.decisionId,
+        symbol,
+        ts: Date.now(),
+        payload: {
+          orderId: response.orderId,
+          status: response.status,
+          response: this.truncate(response),
+        },
+      });
+
+      return { orderId: String(response.orderId || request.clientOrderId || randomUUID()) };
+    } catch (error: any) {
+      this.emitDebug({
+        channel: 'execution',
+        type: 'order_error',
+        order_attempt_id: orderAttemptId,
+        decision_id: context?.decisionId,
+        symbol,
+        ts: Date.now(),
+        payload: {
+          error_class: this.classifyBinanceError(error),
+          message: error?.message || 'order_failed',
+          code: error?.binanceCode || null,
+          response: this.truncate(error?.binanceBody || error?.message),
+        },
+      });
+      throw error;
+    }
   }
 
   async cancelOrder(request: CancelOrderRequest): Promise<void> {
@@ -237,8 +412,7 @@ export class ExecutionConnector {
 
     const params: Record<string, string | number> = {
       symbol: request.symbol,
-      recvWindow: this.config.recvWindowMs,
-      timestamp: Date.now(),
+      recvWindow: Math.trunc(this.config.recvWindowMs || 5000),
     };
 
     if (request.orderId) {
@@ -248,38 +422,35 @@ export class ExecutionConnector {
       params.origClientOrderId = request.clientOrderId;
     }
 
-    await this.signedRequest('/fapi/v1/order', 'DELETE', params);
+    await this.signedRequest({ path: '/fapi/v1/order', method: 'DELETE', params, requiresAuth: true });
   }
 
   async cancelAllOpenOrders(symbol: string): Promise<void> {
     if (!this.apiKey || !this.apiSecret) {
       return;
     }
-    await this.signedRequest('/fapi/v1/allOpenOrders', 'DELETE', {
-      symbol,
-      recvWindow: this.config.recvWindowMs,
-      timestamp: Date.now(),
+
+    await this.signedRequest({
+      path: '/fapi/v1/allOpenOrders',
+      method: 'DELETE',
+      params: {
+        symbol,
+        recvWindow: Math.trunc(this.config.recvWindowMs || 5000),
+      },
+      requiresAuth: true,
     });
   }
 
   async syncState(): Promise<void> {
-    console.log('[CONNECTOR] syncState called, symbols:', Array.from(this.symbols));
     if (!this.apiKey || !this.apiSecret || this.symbols.size === 0) {
-      console.log('[CONNECTOR] syncState skipped - missing creds or no symbols');
       return;
     }
 
     const now = Date.now();
 
     const [balances, positions] = await Promise.all([
-      this.signedRequest('/fapi/v2/balance', 'GET', {
-        recvWindow: this.config.recvWindowMs,
-        timestamp: Date.now(),
-      }),
-      this.signedRequest('/fapi/v2/positionRisk', 'GET', {
-        recvWindow: this.config.recvWindowMs,
-        timestamp: Date.now(),
-      }),
+      this.signedRequest({ path: '/fapi/v2/balance', method: 'GET', requiresAuth: true }),
+      this.signedRequest({ path: '/fapi/v2/positionRisk', method: 'GET', requiresAuth: true }),
     ]);
 
     const usdtBalance = Array.isArray(balances)
@@ -309,10 +480,11 @@ export class ExecutionConnector {
         unrealizedPnL: Number(p?.unRealizedProfit || 0),
       });
 
-      const openOrders = await this.signedRequest('/fapi/v1/openOrders', 'GET', {
-        symbol,
-        recvWindow: this.config.recvWindowMs,
-        timestamp: Date.now(),
+      const openOrders = await this.signedRequest({
+        path: '/fapi/v1/openOrders',
+        method: 'GET',
+        params: { symbol },
+        requiresAuth: true,
       });
 
       if (Array.isArray(openOrders)) {
@@ -348,6 +520,10 @@ export class ExecutionConnector {
       .filter((s: any) => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT')
       .map((s: any) => String(s.symbol))
       .sort();
+  }
+
+  async ensureSymbolsReady() {
+    await this.ensureReadyForSymbols();
   }
 
   private async startUserStream() {
@@ -423,6 +599,7 @@ export class ExecutionConnector {
       this.listenKey = await this.createListenKey();
       this.connectUserWs(this.listenKey);
       await this.syncState();
+      await this.ensureReadyForSymbols();
 
       const resumeTime = Date.now();
       for (const symbol of this.symbols) {
@@ -587,46 +764,37 @@ export class ExecutionConnector {
   }
 
   private async createListenKey(): Promise<string> {
-    const response = await fetch(`${this.config.restBaseUrl}/fapi/v1/listenKey`, {
+    const response = await this.signedRequest({
+      path: '/fapi/v1/listenKey',
       method: 'POST',
-      headers: {
-        'X-MBX-APIKEY': this.apiKey || '',
-      },
+      requiresAuth: false,
+      params: {},
     });
-    if (!response.ok) {
-      throw new Error(`listenKey create failed: ${response.status}`);
-    }
-    const body: any = await response.json();
-    if (!body.listenKey) {
+    if (!response.listenKey) {
       throw new Error('listenKey missing in response');
     }
-    return String(body.listenKey);
+    return String(response.listenKey);
   }
 
   private async keepAliveListenKey(listenKey: string): Promise<void> {
-    await fetch(`${this.config.restBaseUrl}/fapi/v1/listenKey`, {
+    await this.signedRequest({
+      path: '/fapi/v1/listenKey',
       method: 'PUT',
-      headers: {
-        'X-MBX-APIKEY': this.apiKey || '',
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: `listenKey=${encodeURIComponent(listenKey)}`,
+      requiresAuth: false,
+      params: { listenKey },
     });
   }
 
   private async deleteListenKey(listenKey: string): Promise<void> {
-    await fetch(`${this.config.restBaseUrl}/fapi/v1/listenKey`, {
+    await this.signedRequest({
+      path: '/fapi/v1/listenKey',
       method: 'DELETE',
-      headers: {
-        'X-MBX-APIKEY': this.apiKey || '',
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: `listenKey=${encodeURIComponent(listenKey)}`,
+      requiresAuth: false,
+      params: { listenKey },
     });
   }
 
   private emitEvent(event: ExecutionEvent) {
-    this.lastSequenceEventMs = Math.max(this.lastSequenceEventMs, event.event_time_ms);
     for (const listener of this.listeners) {
       listener(event);
     }
@@ -639,48 +807,366 @@ export class ExecutionConnector {
     }
   }
 
-  private async signedRequest(path: string, method: 'GET' | 'POST' | 'DELETE', params: Record<string, string | number | boolean>): Promise<any> {
+  private emitDebug(event: ExecutionDebugEvent) {
+    for (const listener of this.debugListeners) {
+      listener(event);
+    }
+  }
+
+  private aggregateReadiness(): { ready: boolean; reason: string | null } {
+    if (this.symbols.size === 0) {
+      return { ready: false, reason: 'symbol_not_selected' };
+    }
+    for (const symbol of this.symbols) {
+      const r = this.readyBySymbol.get(symbol);
+      if (!r?.ready) {
+        return { ready: false, reason: r?.reason || `symbol_not_ready:${symbol}` };
+      }
+    }
+    return { ready: true, reason: null };
+  }
+
+  private async ensureReadyForSymbols() {
+    for (const symbol of this.symbols) {
+      try {
+        await this.ensureSymbolExecutionReady(symbol);
+        this.readyBySymbol.set(symbol, { ready: true, reason: null });
+        this.emitDebug({
+          channel: 'execution',
+          type: 'readiness',
+          symbol,
+          ts: Date.now(),
+          payload: { ready: true },
+        });
+      } catch (e: any) {
+        const reason = e?.message || 'execution_not_ready';
+        this.readyBySymbol.set(symbol, { ready: false, reason });
+        this.emitDebug({
+          channel: 'execution',
+          type: 'readiness',
+          symbol,
+          ts: Date.now(),
+          payload: { ready: false, reason },
+        });
+      }
+    }
+    this.emitStatus();
+  }
+
+  private async ensureSymbolExecutionReady(symbol: string) {
+    await this.loadExchangeInfo();
+    await this.loadPositionMode();
+
+    const rules = this.symbolRules.get(symbol);
+    if (!rules) {
+      throw new Error(`symbol_not_in_testnet_exchange_info:${symbol}`);
+    }
+
+    const leverage = Math.max(1, Math.trunc(this.config.defaultLeverage || 20));
+    await this.signedRequest({
+      path: '/fapi/v1/leverage',
+      method: 'POST',
+      requiresAuth: true,
+      params: { symbol, leverage },
+    });
+
+    const marginType: MarginType = this.config.defaultMarginType || 'ISOLATED';
+    try {
+      await this.signedRequest({
+        path: '/fapi/v1/marginType',
+        method: 'POST',
+        requiresAuth: true,
+        params: { symbol, marginType },
+      });
+    } catch (error: any) {
+      const code = Number(error?.binanceCode);
+      if (code !== -4046) {
+        throw error;
+      }
+    }
+  }
+
+  private async loadExchangeInfo() {
+    if (this.exchangeInfoLoaded) {
+      return;
+    }
+
+    const response = await fetch(`${this.config.restBaseUrl}/fapi/v1/exchangeInfo`);
+    if (!response.ok) {
+      throw new Error(`exchange_info_failed:${response.status}`);
+    }
+
+    const body: any = await response.json();
+    const symbols = Array.isArray(body.symbols) ? body.symbols : [];
+    for (const symbolInfo of symbols) {
+      const symbol = String(symbolInfo.symbol || '');
+      if (!symbol) {
+        continue;
+      }
+      const lot = Array.isArray(symbolInfo.filters)
+        ? symbolInfo.filters.find((f: any) => f.filterType === 'LOT_SIZE' || f.filterType === 'MARKET_LOT_SIZE')
+        : null;
+      const priceFilter = Array.isArray(symbolInfo.filters)
+        ? symbolInfo.filters.find((f: any) => f.filterType === 'PRICE_FILTER')
+        : null;
+
+      this.symbolRules.set(symbol, {
+        minQty: Number(lot?.minQty || 0),
+        maxQty: Number(lot?.maxQty || Number.POSITIVE_INFINITY),
+        stepSize: Number(lot?.stepSize || 0.001),
+        priceTickSize: Number(priceFilter?.tickSize || 0.01),
+        minNotional: Number(
+          (Array.isArray(symbolInfo.filters)
+            ? symbolInfo.filters.find((f: any) => f.filterType === 'MIN_NOTIONAL' || f.filterType === 'NOTIONAL')?.notional
+            : null) || 0
+        ),
+      });
+    }
+
+    this.exchangeInfoLoaded = true;
+  }
+
+  private async loadPositionMode() {
+    const response = await this.signedRequest({
+      path: '/fapi/v1/positionSide/dual',
+      method: 'GET',
+      requiresAuth: true,
+    });
+    this.dualSidePosition = String(response?.dualSidePosition) === 'true';
+    this.emitStatus();
+  }
+
+  private resolvePositionSide(request: PlaceOrderRequest): 'LONG' | 'SHORT' | 'BOTH' {
+    if (request.positionSide) {
+      return request.positionSide;
+    }
+
+    if (!this.dualSidePosition) {
+      return 'BOTH';
+    }
+
+    return request.side === 'BUY' ? 'LONG' : 'SHORT';
+  }
+
+  private async normalizeQuantity(symbol: string, side: 'BUY' | 'SELL', rawQty: number): Promise<string> {
+    const rules = this.symbolRules.get(symbol);
+    if (!rules) {
+      throw new Error(`missing_symbol_rules:${symbol}`);
+    }
+
+    if (!Number.isFinite(rawQty) || rawQty <= 0) {
+      throw new Error(`invalid_quantity:${rawQty}`);
+    }
+
+    const step = rules.stepSize > 0 ? rules.stepSize : 0.001;
+    const stepDigits = this.stepDigits(step);
+
+    let qty = Math.floor(rawQty / step) * step;
+    if (qty < rules.minQty) {
+      qty = rules.minQty;
+    }
+    if (Number.isFinite(rules.maxQty) && qty > rules.maxQty) {
+      qty = rules.maxQty;
+    }
+
+    if (rules.minNotional > 0) {
+      const marketPrice = await this.referencePrice(symbol, side);
+      if (marketPrice > 0) {
+        const currentNotional = qty * marketPrice;
+        if (currentNotional < rules.minNotional) {
+          const minQtyFromNotional = rules.minNotional / marketPrice;
+          qty = Math.ceil(minQtyFromNotional / step) * step;
+        }
+      }
+    }
+
+    if (Number.isFinite(rules.maxQty) && qty > rules.maxQty) {
+      qty = rules.maxQty;
+    }
+
+    if (qty <= 0) {
+      throw new Error(`normalized_quantity_non_positive:${qty}`);
+    }
+
+    return qty.toFixed(stepDigits);
+  }
+
+  private async referencePrice(symbol: string, side: 'BUY' | 'SELL'): Promise<number> {
+    const quote = this.getQuote(symbol);
+    if (quote) {
+      return side === 'BUY' ? quote.bestAsk : quote.bestBid;
+    }
+
+    const response = await fetch(`${this.config.restBaseUrl}/fapi/v1/ticker/price?symbol=${symbol}`);
+    if (!response.ok) {
+      return 0;
+    }
+    const body: any = await response.json();
+    return Number(body.price || 0);
+  }
+
+  private stepDigits(step: number): number {
+    const stepString = step.toString();
+    if (!stepString.includes('.')) {
+      return 0;
+    }
+    return stepString.split('.')[1].replace(/0+$/, '').length;
+  }
+
+  private async syncServerTimeOffset() {
+    const t0 = Date.now();
+    const response = await fetch(`${this.config.restBaseUrl}/fapi/v1/time`);
+    if (!response.ok) {
+      throw new Error(`server_time_sync_failed:${response.status}`);
+    }
+    const body: any = await response.json();
+    const t1 = Date.now();
+    const serverTime = Number(body?.serverTime || 0);
+    const rttHalf = Math.floor((t1 - t0) / 2);
+    this.serverTimeOffsetMs = serverTime - (t0 + rttHalf);
+    this.emitStatus();
+  }
+
+  private sanitizeParams(params?: Record<string, string | number | boolean | undefined | null>): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (!params) {
+      return out;
+    }
+
+    const keys = Object.keys(params).sort();
+    for (const key of keys) {
+      const value = params[key];
+      if (value === undefined || value === null) {
+        continue;
+      }
+      if (typeof value === 'number') {
+        out[key] = Number.isInteger(value) ? String(Math.trunc(value)) : String(value);
+        continue;
+      }
+      if (typeof value === 'boolean') {
+        out[key] = value ? 'true' : 'false';
+        continue;
+      }
+      out[key] = String(value);
+    }
+    return out;
+  }
+
+  private async signedRequest(options: SignedRequestOptions): Promise<any> {
     const apiKey = this.apiKey;
     const secret = this.apiSecret;
     if (!apiKey || !secret) {
       throw new Error('Execution connector is missing API keys');
     }
 
-    const query = new URLSearchParams();
-    for (const [k, v] of Object.entries(params)) {
-      query.set(k, String(v));
+    const params = this.sanitizeParams(options.params);
+
+    if (options.requiresAuth) {
+      params.recvWindow = String(Math.trunc(this.config.recvWindowMs || 5000));
+      params.timestamp = String(Date.now() + this.serverTimeOffsetMs);
     }
 
-    const signature = createHmac('sha256', secret).update(query.toString()).digest('hex');
-    query.set('signature', signature);
+    const sortedParams = new URLSearchParams();
+    for (const key of Object.keys(params).sort()) {
+      sortedParams.set(key, params[key]);
+    }
+    const queryNoSignature = sortedParams.toString();
+    const signature = createHmac('sha256', secret).update(queryNoSignature).digest('hex');
+    const signedQuery = options.requiresAuth
+      ? `${queryNoSignature}${queryNoSignature ? '&' : ''}signature=${signature}`
+      : queryNoSignature;
 
-    const url = `${this.config.restBaseUrl}${path}?${query.toString()}`;
+    const url = `${this.config.restBaseUrl}${options.path}${signedQuery ? `?${signedQuery}` : ''}`;
+
+    this.emitDebug({
+      channel: 'execution',
+      type: 'request_debug',
+      order_attempt_id: options.orderAttemptId,
+      ts: Date.now(),
+      payload: {
+        method: options.method,
+        baseUrl: this.config.restBaseUrl,
+        path: options.path,
+        params,
+        query_string: queryNoSignature,
+        signature_len: signature.length,
+        recvWindow: params.recvWindow ? Number(params.recvWindow) : null,
+        timestamp: params.timestamp ? Number(params.timestamp) : null,
+      },
+    });
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+    const timeout = setTimeout(() => controller.abort(), 10_000);
 
+    let response: Response;
     try {
-      const response = await fetch(url, {
-        method,
+      response = await fetch(url, {
+        method: options.method,
         headers: {
           'X-MBX-APIKEY': apiKey,
+          'Content-Type': 'application/json',
         },
         signal: controller.signal,
       });
-
-      if (!response.ok) {
-        const errBody = await response.text();
-        throw new Error(`Binance ${method} ${path} failed (${response.status}): ${errBody}`);
-      }
-
-      return await response.json();
-    } catch (e: any) {
-      if (e.name === 'AbortError') {
-        throw new Error(`Binance ${method} ${path} request timed out after 10s`);
-      }
-      throw e;
     } finally {
       clearTimeout(timeout);
     }
+
+    const raw = await response.text();
+    let body: any = raw;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      // keep raw
+    }
+
+    if (!response.ok) {
+      const binanceCode = typeof body?.code === 'number' ? body.code : null;
+      const err: any = new Error(`Binance ${options.method} ${options.path} failed (${response.status})`);
+      err.binanceCode = binanceCode;
+      err.binanceBody = body;
+      err.httpStatus = response.status;
+
+      this.emitDebug({
+        channel: 'execution',
+        type: 'request_error',
+        order_attempt_id: options.orderAttemptId,
+        ts: Date.now(),
+        payload: {
+          method: options.method,
+          path: options.path,
+          status: response.status,
+          error_class: this.classifyBinanceError(err),
+          code: binanceCode,
+          message: err.message,
+          response: this.truncate(body),
+        },
+      });
+
+      throw err;
+    }
+
+    return body;
+  }
+
+  private classifyBinanceError(error: any): string {
+    const code = Number(error?.binanceCode);
+    if (code === -1021) return 'timestamp_out_of_window';
+    if (code === -1022) return 'invalid_signature';
+    if (code === -2015) return 'invalid_key_or_permissions';
+    if (code === -1102) return 'missing_mandatory_param';
+    if (code === -4164) return 'min_notional_too_small';
+    return 'unknown_binance_error';
+  }
+
+  private truncate(value: any): any {
+    const str = typeof value === 'string' ? value : JSON.stringify(value);
+    if (!str) {
+      return value;
+    }
+    if (str.length <= 1000) {
+      return value;
+    }
+    return str.slice(0, 1000);
   }
 }

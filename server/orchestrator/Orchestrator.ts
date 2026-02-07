@@ -63,6 +63,9 @@ export class Orchestrator {
       }
       this.ingestExecutionReplay(event);
     });
+    this.connector.onDebug((event) => {
+      this.logger.logExecution(event.ts, event);
+    });
   }
 
   async start() {
@@ -338,6 +341,7 @@ export class Orchestrator {
 
     this.connector.setSymbols(normalized);
     await this.connector.syncState();
+    await this.connector.ensureSymbolsReady();
   }
 
   private getActor(symbol: string): SymbolActor {
@@ -350,7 +354,6 @@ export class Orchestrator {
       symbol,
       decisionEngine: this.decisionEngine,
       onActions: async (actions) => {
-        console.log(`[ORCHESTRATOR] onActions called for ${symbol}:`, actions.map(a => a.type).join(', '));
         await this.executeActions(symbol, actions);
       },
       onDecisionLogged: ({ symbol: s, canonical_time_ms, exchange_event_time_ms, gate, actions, state }) => {
@@ -409,11 +412,35 @@ export class Orchestrator {
   private async executeActions(symbol: string, actions: DecisionAction[]) {
     const actor = this.getActor(symbol);
     for (const action of actions) {
+      const decisionId = `${symbol}_${action.event_time_ms}`;
+      const orderAttemptId = `${decisionId}_${action.type}`;
       if (action.type === 'NOOP') {
         continue;
       }
 
       if (!this.connector.isExecutionEnabled()) {
+        this.logger.logExecution(action.event_time_ms, {
+          channel: 'execution',
+          type: 'why_not_sent',
+          ts: action.event_time_ms,
+          decision_id: decisionId,
+          order_attempt_id: orderAttemptId,
+          symbol,
+          payload: { why_not_sent: 'disabled' },
+        });
+        continue;
+      }
+
+      if (!this.connector.isConnected()) {
+        this.logger.logExecution(action.event_time_ms, {
+          channel: 'execution',
+          type: 'why_not_sent',
+          ts: action.event_time_ms,
+          decision_id: decisionId,
+          order_attempt_id: orderAttemptId,
+          symbol,
+          payload: { why_not_sent: 'not_connected' },
+        });
         continue;
       }
 
@@ -438,8 +465,9 @@ export class Orchestrator {
           type: 'MARKET',
           quantity: position.qty,
           reduceOnly: true,
+          positionSide: position.side,
           clientOrderId,
-        });
+        }, { decisionId, orderAttemptId });
         this.expectedByOrderId.set(response.orderId, {
           expectedPrice: action.expectedPrice || null,
           sentAtMs: action.event_time_ms,
@@ -451,7 +479,6 @@ export class Orchestrator {
       if ((action.type === 'ENTRY_PROBE' || action.type === 'ADD_POSITION') && action.side && action.quantity && action.quantity > 0) {
         const tag = action.type === 'ENTRY_PROBE' ? 'entry' : 'add';
         const clientOrderId = this.clientOrderId(tag, symbol, action.event_time_ms);
-        console.log(`[EXEC] Placing order: ${symbol} ${action.side} ${action.quantity} @ MARKET`);
         try {
           const response = await this.connector.placeOrder({
             symbol,
@@ -459,9 +486,9 @@ export class Orchestrator {
             type: 'MARKET',
             quantity: action.quantity,
             reduceOnly: false,
+            positionSide: action.side === 'BUY' ? 'LONG' : 'SHORT',
             clientOrderId,
-          });
-          console.log(`[EXEC] Order placed: orderId=${response.orderId}`);
+          }, { decisionId, orderAttemptId });
 
           this.expectedByOrderId.set(response.orderId, {
             expectedPrice: action.expectedPrice || null,
@@ -494,6 +521,8 @@ export function createOrchestratorFromEnv(): Orchestrator {
     userDataWsBaseUrl: process.env.BINANCE_TESTNET_USER_WS_BASE || 'wss://stream.binancefuture.com',
     marketWsBaseUrl: process.env.BINANCE_TESTNET_MARKET_WS_BASE || 'wss://stream.binancefuture.com',
     recvWindowMs: Number(process.env.BINANCE_RECV_WINDOW_MS || 5000),
+    defaultMarginType: (String(process.env.DEFAULT_MARGIN_TYPE || 'ISOLATED').toUpperCase() === 'CROSSED' ? 'CROSSED' : 'ISOLATED'),
+    defaultLeverage: Number(process.env.DEFAULT_SYMBOL_LEVERAGE || 20),
   });
 
   return new Orchestrator(connector, {

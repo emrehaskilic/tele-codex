@@ -1,6 +1,7 @@
 export type Side = 'BUY' | 'SELL';
 export type PositionSide = 'LONG' | 'SHORT';
 export type OrderType = 'MARKET' | 'LIMIT';
+export type MarginType = 'ISOLATED' | 'CROSSED';
 
 export interface TestnetQuote {
   symbol: string;
@@ -96,6 +97,7 @@ export interface PlaceOrderRequest {
   quantity: number;
   price?: number;
   reduceOnly?: boolean;
+  positionSide?: 'LONG' | 'SHORT' | 'BOTH';
   clientOrderId: string;
 }
 
@@ -113,4 +115,6 @@ export interface ExecutionConnectorConfig {
   userDataWsBaseUrl: string;
   marketWsBaseUrl: string;
   recvWindowMs: number;
+  defaultMarginType?: MarginType;
+  defaultLeverage?: number;
 }
