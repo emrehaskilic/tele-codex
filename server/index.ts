@@ -62,23 +62,9 @@ const ALLOWED_ORIGINS = [
 ];
 
 // Rate Limiting
-const SNAPSHOT_MIN_INTERVAL_MS = Number(process.env.SNAPSHOT_MIN_INTERVAL_MS || 1500);
+const SNAPSHOT_MIN_INTERVAL_MS = 60000;
 const MIN_BACKOFF_MS = 5000;
 const MAX_BACKOFF_MS = 120000;
-const DEPTH_QUEUE_MAX = Number(process.env.DEPTH_QUEUE_MAX || 2000);
-const DEPTH_LAG_MAX_MS = Number(process.env.DEPTH_LAG_MAX_MS || 2000);
-const LIVE_SNAPSHOT_FRESH_MS = Number(process.env.LIVE_SNAPSHOT_FRESH_MS || 15000);
-const LIVE_DESYNC_RATE_10S_MAX = Number(process.env.LIVE_DESYNC_RATE_10S_MAX || 50);
-const LIVE_QUEUE_MAX = Number(process.env.LIVE_QUEUE_MAX || 200);
-const LIVE_GOOD_SEQUENCE_MIN = Number(process.env.LIVE_GOOD_SEQUENCE_MIN || 25);
-const AUTO_SCALE_MIN_SYMBOLS = 1;
-const AUTO_SCALE_LIVE_DOWN_PCT = 80;
-const AUTO_SCALE_LIVE_UP_PCT = 95;
-const AUTO_SCALE_UP_HOLD_MS = 10 * 60 * 1000;
-const DEPTH_LEVELS = Number(process.env.DEPTH_LEVELS || 20);
-const DEPTH_STREAM_MODE = String(process.env.DEPTH_STREAM_MODE || 'diff').toLowerCase(); // diff | partial
-const WS_UPDATE_SPEED = String(process.env.WS_UPDATE_SPEED || '250ms'); // 100ms | 250ms
-const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
 
 // =============================================================================
 // Logging
@@ -118,25 +104,6 @@ interface SymbolMeta {
     metricsBroadcastTradeCount10s: number;
     lastMetricsBroadcastReason: 'depth' | 'trade' | 'none';
     applyCount10s: number;
-    // Reliability
-    depthQueue: Array<{
-        U: number;
-        u: number;
-        b: [string, string][];
-        a: [string, string][];
-        eventTimeMs: number;
-        receiptTimeMs: number;
-    }>;
-    isProcessingDepthQueue: boolean;
-    goodSequenceStreak: number;
-    lastStateTransitionTs: number;
-    lastLiveTs: number;
-    lastBlockedTelemetryTs: number;
-    // Rolling windows
-    desyncEvents: number[];
-    snapshotOkEvents: number[];
-    snapshotSkipEvents: number[];
-    liveSamples: Array<{ ts: number; live: boolean }>;
 }
 
 const symbolMeta = new Map<string, SymbolMeta>();
@@ -162,8 +129,6 @@ const EXCHANGE_INFO_TTL_MS = 1000 * 60 * 60; // 1 hr
 
 // Global Rate Limit
 let globalBackoffUntil = 0; // Starts at 0 to allow fresh attempts on restart
-let symbolConcurrencyLimit = Math.max(AUTO_SCALE_MIN_SYMBOLS, Number(process.env.SYMBOL_CONCURRENCY || 1));
-let autoScaleLastUpTs = 0;
 
 // =============================================================================
 // Helpers
@@ -192,17 +157,7 @@ function getMeta(symbol: string): SymbolMeta {
             metricsBroadcastDepthCount10s: 0,
             metricsBroadcastTradeCount10s: 0,
             lastMetricsBroadcastReason: 'none',
-            applyCount10s: 0,
-            depthQueue: [],
-            isProcessingDepthQueue: false,
-            goodSequenceStreak: 0,
-            lastStateTransitionTs: Date.now(),
-            lastLiveTs: 0,
-            lastBlockedTelemetryTs: 0,
-            desyncEvents: [],
-            snapshotOkEvents: [],
-            snapshotSkipEvents: [],
-            liveSamples: []
+            applyCount10s: 0
         };
         symbolMeta.set(symbol, meta);
     }
@@ -216,54 +171,6 @@ function getOrderbook(symbol: string): OrderbookState {
         orderbookMap.set(symbol, state);
     }
     return state;
-}
-
-function pruneWindow(values: number[], windowMs: number, now: number): void {
-    while (values.length > 0 && now - values[0] > windowMs) {
-        values.shift();
-    }
-}
-
-function countWindow(values: number[], windowMs: number, now: number): number {
-    pruneWindow(values, windowMs, now);
-    return values.length;
-}
-
-function recordLiveSample(symbol: string, live: boolean): void {
-    const meta = getMeta(symbol);
-    const now = Date.now();
-    meta.liveSamples.push({ ts: now, live });
-    while (meta.liveSamples.length > 0 && now - meta.liveSamples[0].ts > 60000) {
-        meta.liveSamples.shift();
-    }
-}
-
-function liveUptimePct60s(symbol: string): number {
-    const meta = getMeta(symbol);
-    const now = Date.now();
-    while (meta.liveSamples.length > 0 && now - meta.liveSamples[0].ts > 60000) {
-        meta.liveSamples.shift();
-    }
-    if (meta.liveSamples.length === 0) {
-        return 0;
-    }
-    const liveCount = meta.liveSamples.reduce((acc, sample) => acc + (sample.live ? 1 : 0), 0);
-    return (liveCount / meta.liveSamples.length) * 100;
-}
-
-function transitionOrderbookState(symbol: string, to: OrderbookState['uiState'], trigger: string, detail: any = {}) {
-    const ob = getOrderbook(symbol);
-    const from = ob.uiState;
-    if (from === to) {
-        return;
-    }
-    ob.uiState = to;
-    const meta = getMeta(symbol);
-    meta.lastStateTransitionTs = Date.now();
-    if (to === 'LIVE') {
-        meta.lastLiveTs = meta.lastStateTransitionTs;
-    }
-    log('ORDERBOOK_STATE_TRANSITION', { symbol, from, to, trigger, ...detail });
 }
 
 // Lazy Metric Getters
@@ -311,29 +218,38 @@ async function fetchExchangeInfo() {
     }
 }
 
-async function fetchSnapshot(symbol: string, trigger: string, force = false) {
+async function fetchSnapshot(symbol: string) {
     const meta = getMeta(symbol);
     const ob = getOrderbook(symbol);
     const now = Date.now();
 
+    // 1. Global Check (Skip if UNSEEDED to force first boot, unless actually 429'd recently)
+    // We assume restart means we "want" to try. But let's respect if it's huge.
+    // Better strategy: If UNSEEDED, we try ONCE even if `globalBackoffUntil` is slightly future, 
+    // BUT since we just restarted, `globalBackoffUntil` is 0 anyway.
     if (now < globalBackoffUntil) {
+        // If UNSEEDED, we might want to prioritize this, but if we are globally blocked by 418, we MUST wait.
         log('SNAPSHOT_SKIP_GLOBAL', { symbol, wait: globalBackoffUntil - now });
         return;
     }
 
-    const waitMs = Math.max(SNAPSHOT_MIN_INTERVAL_MS, meta.backoffMs);
-    if (now - meta.lastSnapshotAttempt < waitMs) {
-        meta.snapshotSkipEvents.push(now);
-        log('SNAPSHOT_SKIP_LOCAL', { symbol, trigger, force, wait: waitMs - (now - meta.lastSnapshotAttempt) });
-        return;
+    // 2. Local Check
+    // Allow immediate retry if UNSEEDED
+    if (ob.uiState !== 'UNSEEDED') {
+        if (now - meta.lastSnapshotAttempt < SNAPSHOT_MIN_INTERVAL_MS && now - meta.lastSnapshotAttempt < meta.backoffMs) {
+            log('SNAPSHOT_SKIP_LOCAL', { symbol, wait: Math.max(SNAPSHOT_MIN_INTERVAL_MS, meta.backoffMs) - (now - meta.lastSnapshotAttempt) });
+            return;
+        }
     }
 
     meta.lastSnapshotAttempt = now;
     meta.isResyncing = true;
-    transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', trigger);
+    // Don't set RESYNCING if unseeded, keep UNSEEDED until success? No, RESYNCING is fine.
+    // Actually OrderbookManager handles UNSEEDED -> Buffer. RESYNCING -> also Buffer.
+    ob.uiState = 'RESYNCING';
 
     try {
-        log('SNAPSHOT_REQ', { symbol, trigger });
+        log('SNAPSHOT_REQ', { symbol });
         const res = await fetch(`${BINANCE_REST_BASE}/fapi/v1/depth?symbol=${symbol}&limit=1000`);
 
         meta.lastSnapshotHttpStatus = res.status;
@@ -344,57 +260,44 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
             globalBackoffUntil = Date.now() + retryAfter;
             meta.backoffMs = Math.min(meta.backoffMs * 2, MAX_BACKOFF_MS);
             log('SNAPSHOT_429', { symbol, retryAfter, backoff: meta.backoffMs, weight });
-            transitionOrderbookState(symbol, 'HALTED', 'snapshot_429', { retryAfter });
+            ob.uiState = 'STALE';
             return;
         }
 
         if (!res.ok) {
-            log('SNAPSHOT_FAIL', { symbol, trigger, status: res.status });
+            log('SNAPSHOT_FAIL', { symbol, status: res.status });
             meta.backoffMs = Math.min(meta.backoffMs * 2, MAX_BACKOFF_MS);
             meta.consecutiveErrors++;
-            transitionOrderbookState(symbol, 'RESYNCING', 'snapshot_http_fail', { status: res.status });
+            ob.uiState = meta.consecutiveErrors > 3 ? 'STALE' : 'RESYNCING';
             return;
         }
 
         const data: any = await res.json();
-        transitionOrderbookState(symbol, 'APPLYING_SNAPSHOT', 'snapshot_received', { lastUpdateId: data.lastUpdateId });
 
-        const snapshotResult = applySnapshot(ob, data);
+        // Success
+        applySnapshot(ob, data);
         meta.lastSnapshotOk = now;
-        meta.snapshotOkEvents.push(now);
         meta.snapshotLastUpdateId = data.lastUpdateId;
         meta.backoffMs = MIN_BACKOFF_MS;
         meta.consecutiveErrors = 0;
         meta.isResyncing = false;
         meta.snapshotCount++;
-        meta.goodSequenceStreak = snapshotResult.ok ? Math.max(meta.goodSequenceStreak, snapshotResult.appliedCount) : 0;
 
+        // Debug: SNAPSHOT_TOP event
         log('SNAPSHOT_TOP', {
             symbol,
             snapshotLastUpdateId: data.lastUpdateId,
             bestBid: bestBid(ob),
             bestAsk: bestAsk(ob),
             bidsCount: ob.bids.size,
-            asksCount: ob.asks.size,
-            bufferedApplied: snapshotResult.appliedCount,
-            bufferedDropped: snapshotResult.droppedCount,
-            gapDetected: snapshotResult.gapDetected
+            asksCount: ob.asks.size
         });
 
-        if (snapshotResult.ok) {
-            transitionOrderbookState(symbol, 'RESYNCING', 'snapshot_applied_wait_live_window');
-            log('SNAPSHOT_OK', { symbol, trigger, lastUpdateId: data.lastUpdateId });
-        } else {
-            transitionOrderbookState(symbol, 'RESYNCING', 'snapshot_buffer_gap_detected');
-            log('SNAPSHOT_BUFFER_GAP', { symbol, trigger, lastUpdateId: data.lastUpdateId });
-        }
+        log('SNAPSHOT_OK', { symbol, lastUpdateId: data.lastUpdateId });
 
     } catch (e: any) {
         log('SNAPSHOT_ERR', { symbol, err: e.message });
         meta.backoffMs = Math.min(meta.backoffMs * 2, MAX_BACKOFF_MS);
-        transitionOrderbookState(symbol, 'RESYNCING', 'snapshot_exception', { error: e.message });
-    } finally {
-        meta.isResyncing = false;
     }
 }
 
@@ -407,14 +310,6 @@ let wsState = 'disconnected';
 let activeSymbols = new Set<string>();
 const clients = new Set<WebSocket>();
 const clientSubs = new Map<WebSocket, Set<string>>();
-let autoScaleForcedSingle = false;
-
-function buildDepthStream(symbolLower: string): string {
-    if (DEPTH_STREAM_MODE === 'partial') {
-        return `${symbolLower}@depth${DEPTH_LEVELS}@${WS_UPDATE_SPEED}`;
-    }
-    return `${symbolLower}@depth@${WS_UPDATE_SPEED}`;
-}
 
 function updateStreams() {
     const required = new Set<string>();
@@ -423,25 +318,12 @@ function updateStreams() {
         if (subs) subs.forEach(s => required.add(s));
     });
 
-    const requiredSorted = [...required].sort();
-    const limitedSymbols = requiredSorted.slice(0, Math.max(AUTO_SCALE_MIN_SYMBOLS, symbolConcurrencyLimit));
-    const effective = new Set<string>(limitedSymbols);
-
-    if (requiredSorted.length > limitedSymbols.length) {
-        log('AUTO_SCALE_APPLIED', {
-            requested: requiredSorted.length,
-            activeLimit: symbolConcurrencyLimit,
-            kept: limitedSymbols,
-            dropped: requiredSorted.slice(limitedSymbols.length),
-        });
-    }
-
     // Simple diff check
-    if (effective.size === activeSymbols.size && [...effective].every(s => activeSymbols.has(s))) {
+    if (required.size === activeSymbols.size && [...required].every(s => activeSymbols.has(s))) {
         if (ws && ws.readyState === WebSocket.OPEN) return;
     }
 
-    if (effective.size === 0) {
+    if (required.size === 0) {
         if (ws) ws.close();
         ws = null;
         wsState = 'disconnected';
@@ -451,10 +333,10 @@ function updateStreams() {
 
     if (ws) ws.close();
 
-    activeSymbols = new Set(effective);
+    activeSymbols = new Set(required);
     const streams = [...activeSymbols].flatMap(s => {
         const l = s.toLowerCase();
-        return [buildDepthStream(l), `${l}@trade`];
+        return [`${l}@depth@100ms`, `${l}@trade`]; // Using @trade for tape, @depth for OB
     });
 
     const url = `${BINANCE_WS_BASE}?streams=${streams.join('/')}`;
@@ -466,13 +348,6 @@ function updateStreams() {
     ws.on('open', () => {
         wsState = 'connected';
         log('WS_OPEN', {});
-        activeSymbols.forEach((symbol) => {
-            const ob = getOrderbook(symbol);
-            if (ob.uiState === 'INIT' || ob.lastUpdateId === 0) {
-                transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'ws_open_seed');
-                fetchSnapshot(symbol, 'ws_open_seed', true).catch(() => { });
-            }
-        });
     });
 
     ws.on('message', (raw: Buffer) => handleMsg(raw));
@@ -484,216 +359,6 @@ function updateStreams() {
     });
 
     ws.on('error', (e) => log('WS_ERROR', { msg: e.message }));
-}
-
-function enqueueDepthUpdate(symbol: string, update: { U: number; u: number; b: [string, string][]; a: [string, string][]; eventTimeMs: number; receiptTimeMs: number }) {
-    const meta = getMeta(symbol);
-    meta.depthQueue.push(update);
-    if (meta.depthQueue.length > DEPTH_QUEUE_MAX) {
-        meta.depthQueue = [];
-        meta.desyncCount++;
-        meta.desyncEvents.push(Date.now());
-        meta.goodSequenceStreak = 0;
-        transitionOrderbookState(symbol, 'RESYNCING', 'queue_overflow', { max: DEPTH_QUEUE_MAX });
-        fetchSnapshot(symbol, 'queue_overflow', true).catch(() => { });
-        return;
-    }
-    processDepthQueue(symbol).catch((e) => {
-        log('DEPTH_QUEUE_PROCESS_ERR', { symbol, error: e.message });
-    });
-}
-
-async function processDepthQueue(symbol: string) {
-    const meta = getMeta(symbol);
-    if (meta.isProcessingDepthQueue) {
-        return;
-    }
-    meta.isProcessingDepthQueue = true;
-    try {
-        while (meta.depthQueue.length > 0) {
-            const update = meta.depthQueue.shift()!;
-            const now = Date.now();
-            const lagMs = now - update.receiptTimeMs;
-            if (lagMs > DEPTH_LAG_MAX_MS) {
-                meta.desyncCount++;
-                meta.desyncEvents.push(now);
-                meta.goodSequenceStreak = 0;
-                meta.depthQueue = [];
-                transitionOrderbookState(symbol, 'RESYNCING', 'lag_too_high', { lagMs, max: DEPTH_LAG_MAX_MS });
-                await fetchSnapshot(symbol, 'lag_too_high', true);
-                break;
-            }
-
-            const ob = getOrderbook(symbol);
-            ob.lastSeenU_u = `${update.U}-${update.u}`;
-            ob.lastDepthTime = now;
-
-            const applied = applyDepthUpdate(ob, update);
-            if (!applied.ok && applied.gapDetected) {
-                meta.desyncCount++;
-                meta.desyncEvents.push(now);
-                meta.goodSequenceStreak = 0;
-                log('DEPTH_DESYNC', { symbol, U: update.U, u: update.u, lastUpdateId: ob.lastUpdateId });
-                transitionOrderbookState(symbol, 'RESYNCING', 'sequence_gap', { U: update.U, u: update.u, lastUpdateId: ob.lastUpdateId });
-                await fetchSnapshot(symbol, 'sequence_gap', true);
-                break;
-            }
-
-            if (applied.applied) {
-                meta.applyCount10s++;
-                meta.goodSequenceStreak++;
-            }
-
-            evaluateLiveReadiness(symbol);
-            emitBlockedReasonTelemetry(symbol);
-
-            const tas = getTaS(symbol);
-            const cvd = getCvd(symbol);
-            const abs = getAbs(symbol);
-            const leg = getLegacy(symbol);
-            const absVal = absorptionResult.get(symbol) ?? 0;
-            broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, update.eventTimeMs || 0, 'depth');
-        }
-    } finally {
-        meta.isProcessingDepthQueue = false;
-    }
-}
-
-function evaluateLiveReadiness(symbol: string) {
-    const meta = getMeta(symbol);
-    const ob = getOrderbook(symbol);
-    const now = Date.now();
-
-    const desyncRate10s = countWindow(meta.desyncEvents, 10000, now);
-    const snapshotFresh = meta.lastSnapshotOk > 0 && (now - meta.lastSnapshotOk) <= LIVE_SNAPSHOT_FRESH_MS;
-    const queueOk = meta.depthQueue.length <= LIVE_QUEUE_MAX;
-    const goodSequence = meta.goodSequenceStreak >= LIVE_GOOD_SEQUENCE_MIN;
-    const hasBook = ob.bids.size > 0 && ob.asks.size > 0;
-
-    const live = snapshotFresh && desyncRate10s <= LIVE_DESYNC_RATE_10S_MAX && queueOk && goodSequence && hasBook;
-    recordLiveSample(symbol, live);
-
-    if (live) {
-        transitionOrderbookState(symbol, 'LIVE', 'live_criteria_met', {
-            desyncRate10s,
-            queueLen: meta.depthQueue.length,
-            goodSequenceStreak: meta.goodSequenceStreak,
-            lastSnapshotOkMsAgo: now - meta.lastSnapshotOk,
-        });
-    } else {
-        transitionOrderbookState(symbol, 'RESYNCING', 'live_criteria_not_met', {
-            desyncRate10s,
-            queueLen: meta.depthQueue.length,
-            goodSequenceStreak: meta.goodSequenceStreak,
-            lastSnapshotOkMsAgo: meta.lastSnapshotOk > 0 ? (now - meta.lastSnapshotOk) : null,
-        });
-    }
-}
-
-function emitBlockedReasonTelemetry(symbol: string) {
-    const meta = getMeta(symbol);
-    const now = Date.now();
-    if (now - meta.lastBlockedTelemetryTs < BLOCKED_TELEMETRY_INTERVAL_MS) {
-        return;
-    }
-    meta.lastBlockedTelemetryTs = now;
-
-    const ob = getOrderbook(symbol);
-    const executionStatus: any = orchestrator.getExecutionStatus();
-    const connectorState = executionStatus?.connection || {};
-    const actorState = (orchestrator.getStateSnapshot() || {})[symbol];
-    const execQuality = actorState?.execQuality?.quality || 'UNKNOWN';
-    const execMetricsPresent = Boolean(actorState?.execQuality?.metricsPresent);
-    const freezeActive = Boolean(actorState?.execQuality?.freezeActive);
-    const legacy = getLegacy(symbol);
-    const maybeMetrics = legacy.computeMetrics(ob);
-
-    const metricsAvailability = {
-        obi: typeof maybeMetrics?.obiDeep === 'number' && Number.isFinite(maybeMetrics.obiDeep),
-        cvd: typeof maybeMetrics?.cvdSlope === 'number' && Number.isFinite(maybeMetrics.cvdSlope),
-        deltaZ: typeof maybeMetrics?.deltaZ === 'number' && Number.isFinite(maybeMetrics.deltaZ),
-    };
-
-    const desyncRate10s = countWindow(meta.desyncEvents, 10000, now);
-    const snapshotSkipRate10s = countWindow(meta.snapshotSkipEvents, 10000, now);
-    const lastSnapshotOkMsAgo = meta.lastSnapshotOk > 0 ? now - meta.lastSnapshotOk : null;
-
-    const dataIntegrityUnstable =
-        ob.uiState !== 'LIVE' ||
-        desyncRate10s > LIVE_DESYNC_RATE_10S_MAX ||
-        meta.depthQueue.length > LIVE_QUEUE_MAX;
-
-    let blockedReason: string | null = null;
-    if (ob.uiState !== 'LIVE') blockedReason = 'orderbook_not_live';
-    else if (!metricsAvailability.obi || !metricsAvailability.cvd || !metricsAvailability.deltaZ) blockedReason = 'metrics_missing';
-    else if (dataIntegrityUnstable) blockedReason = 'data_integrity_unstable';
-    else if (!connectorState?.executionEnabled) blockedReason = 'execution_disabled';
-    else if (!connectorState?.hasCredentials) blockedReason = 'missing_credentials';
-    else if (freezeActive) blockedReason = 'freeze_active';
-    else blockedReason = null;
-
-    log('BLOCKED_REASON', {
-        symbol,
-        ts: now,
-        state: { orderbook_state: ob.uiState, ws_state: wsState },
-        data_integrity: {
-            live: ob.uiState === 'LIVE',
-            desync_rate_10s: desyncRate10s,
-            snapshot_skip_rate_10s: snapshotSkipRate10s,
-            last_snapshot_ok_ms_ago: lastSnapshotOkMsAgo,
-            queue_len: meta.depthQueue.length,
-        },
-        metrics_availability: metricsAvailability,
-        gate: {
-            can_decide: blockedReason === null,
-            blocked_reason: blockedReason || null,
-        },
-        execution: {
-            enabled: Boolean(connectorState?.executionEnabled),
-            hasCredentials: Boolean(connectorState?.hasCredentials),
-            ready: Boolean(connectorState?.ready),
-        },
-        freeze: {
-            active: freezeActive,
-            exec_quality: execQuality,
-            exec_metrics_present: execMetricsPresent,
-        },
-    });
-}
-
-function runAutoScaler() {
-    const symbols = Array.from(activeSymbols);
-    if (symbols.length === 0) {
-        return;
-    }
-
-    const avgLive = symbols.reduce((acc, s) => acc + liveUptimePct60s(s), 0) / symbols.length;
-    const now = Date.now();
-
-    if (avgLive < AUTO_SCALE_LIVE_DOWN_PCT && symbolConcurrencyLimit > AUTO_SCALE_MIN_SYMBOLS) {
-        symbolConcurrencyLimit = AUTO_SCALE_MIN_SYMBOLS;
-        autoScaleForcedSingle = true;
-        log('AUTO_SCALE_DOWN', { avgLiveUptimePct60s: Number(avgLive.toFixed(2)), symbolConcurrencyLimit });
-        updateStreams();
-        return;
-    }
-
-    if (avgLive > AUTO_SCALE_LIVE_UP_PCT) {
-        if (autoScaleLastUpTs === 0) {
-            autoScaleLastUpTs = now;
-        }
-        const heldLongEnough = now - autoScaleLastUpTs >= AUTO_SCALE_UP_HOLD_MS;
-        if (heldLongEnough && autoScaleForcedSingle) {
-            symbolConcurrencyLimit = Math.max(symbolConcurrencyLimit + 1, AUTO_SCALE_MIN_SYMBOLS + 1);
-            autoScaleForcedSingle = false;
-            autoScaleLastUpTs = now;
-            log('AUTO_SCALE_UP', { avgLiveUptimePct60s: Number(avgLive.toFixed(2)), symbolConcurrencyLimit });
-            updateStreams();
-        }
-        return;
-    }
-
-    autoScaleLastUpTs = 0;
 }
 
 function handleMsg(raw: Buffer) {
@@ -711,17 +376,65 @@ function handleMsg(raw: Buffer) {
         meta.depthMsgCount++;
         meta.depthMsgCount10s++;
         meta.lastDepthMsgTs = Date.now();
+        const ob = getOrderbook(s);
+        ob.lastSeenU_u = `${d.U}-${d.u}`;
 
         // Ensure Monitors are running
         ensureMonitors(s);
-        enqueueDepthUpdate(s, {
-            U: Number(d.U || 0),
-            u: Number(d.u || 0),
-            b: Array.isArray(d.b) ? d.b : [],
-            a: Array.isArray(d.a) ? d.a : [],
-            eventTimeMs: Number(d.E || d.T || Date.now()),
-            receiptTimeMs: Date.now(),
-        });
+        ob.lastDepthTime = Date.now();
+
+        // Core Logic: Apply or Buffer
+        const success = applyDepthUpdate(ob, d);
+
+        if (!success) {
+            // Desync detected by OrderbookManager
+            meta.desyncCount++;
+            log('DEPTH_DESYNC', { symbol: s, u: d.u, U: d.U, lastUpdateId: ob.lastUpdateId });
+            // Only trigger snapshot if not already trying
+            if (!meta.isResyncing) fetchSnapshot(s);
+        } else {
+            // Check if we are stuck buffering without seed
+            if (ob.uiState === 'UNSEEDED') {
+                // We are buffering. Log periodically?
+                // logic handled by applyDepthUpdate stats.
+                if (meta.depthMsgCount % 100 === 0) {
+                    log('DEPTH_BUFFERING_NO_SEED', { symbol: s, bufferSize: ob.buffer.length });
+                }
+
+                if (!meta.isResyncing) {
+                    fetchSnapshot(s);
+                }
+            } else {
+                // Track applies
+                meta.applyCount10s++;
+
+                // Broadcast metrics on depth updates (throttled internally by broadcastMetrics)
+                const tas = getTaS(s);
+                const cvd = getCvd(s);
+                const abs = getAbs(s);
+                const leg = getLegacy(s);
+                const absVal = absorptionResult.get(s) ?? 0;
+                broadcastMetrics(s, ob, tas, cvd, absVal, leg, d.E || d.T || 0, 'depth');
+
+                // Debug: BOOK_TOP event (every 200th apply to avoid spam)
+                if (ob.stats.applied % 200 === 0) {
+                    log('BOOK_TOP', {
+                        symbol: s,
+                        bestBid: bestBid(ob),
+                        bestAsk: bestAsk(ob),
+                        bidsCount: ob.bids.size,
+                        asksCount: ob.asks.size,
+                        lastAppliedUpdateId: ob.lastUpdateId
+                    });
+                }
+
+                if (ob.stats.applied % 100 === 0) {
+                    // Log book levels occasionally
+                    const { bids, asks } = getTopLevels(ob, 1);
+                    log('BOOK_LEVELS', { symbol: s, bestBid: bids[0]?.[0], bestAsk: asks[0]?.[0] });
+                }
+            }
+        }
     } else if (e === 'trade') {
         // Trade Tape - Independent of Orderbook State
         const meta = getMeta(s);
@@ -747,7 +460,6 @@ function handleMsg(raw: Buffer) {
 
         // Broadcast
         broadcastMetrics(s, ob, tas, cvd, absVal, leg, t);
-        emitBlockedReasonTelemetry(s);
     }
 }
 
@@ -919,40 +631,21 @@ app.get('/api/health', (req, res) => {
         uptime: Math.floor(process.uptime()),
         ws: { state: wsState, count: activeSymbols.size },
         globalBackoff: Math.max(0, globalBackoffUntil - now),
-        summary: {
-            desync_count_10s: 0,
-            desync_count_60s: 0,
-            snapshot_ok_count_60s: 0,
-            snapshot_skip_count_60s: 0,
-            live_uptime_pct_60s: 0,
-        },
         symbols: {}
     };
 
     activeSymbols.forEach(s => {
         const meta = getMeta(s);
         const ob = getOrderbook(s);
-        const desync10s = countWindow(meta.desyncEvents, 10000, now);
-        const desync60s = countWindow(meta.desyncEvents, 60000, now);
-        const snapshotOk60s = countWindow(meta.snapshotOkEvents, 60000, now);
-        const snapshotSkip60s = countWindow(meta.snapshotSkipEvents, 60000, now);
-        const livePct60s = liveUptimePct60s(s);
         result.symbols[s] = {
             status: ob.uiState,
             lastSnapshot: meta.lastSnapshotOk ? Math.floor((now - meta.lastSnapshotOk) / 1000) + 's ago' : 'never',
             lastSnapshotOkTs: meta.lastSnapshotOk,
             snapshotLastUpdateId: meta.snapshotLastUpdateId,
             lastSnapshotHttpStatus: meta.lastSnapshotHttpStatus,
-            desync_count_10s: desync10s,
-            desync_count_60s: desync60s,
-            snapshot_ok_count_60s: snapshotOk60s,
-            snapshot_skip_count_60s: snapshotSkip60s,
-            live_uptime_pct_60s: Number(livePct60s.toFixed(2)),
-            last_live_ts: meta.lastLiveTs,
-            last_snapshot_ok_ts: meta.lastSnapshotOk,
             depthMsgCount10s: meta.depthMsgCount10s,
             lastDepthMsgTs: meta.lastDepthMsgTs,
-            bufferedDepthCount: ob.buffer.length,
+            bufferedDepthCount: ob.stats.buffered,
             applyCount: ob.stats.applied,
             applyCount10s: meta.applyCount10s,
             dropCount: ob.stats.dropped,
@@ -973,20 +666,8 @@ app.get('/api/health', (req, res) => {
             backoff: meta.backoffMs,
             trades: meta.tradeMsgCount
         };
-        result.summary.desync_count_10s += desync10s;
-        result.summary.desync_count_60s += desync60s;
-        result.summary.snapshot_ok_count_60s += snapshotOk60s;
-        result.summary.snapshot_skip_count_60s += snapshotSkip60s;
-        result.summary.live_uptime_pct_60s += livePct60s;
     });
-    if (activeSymbols.size > 0) {
-        result.summary.live_uptime_pct_60s = Number((result.summary.live_uptime_pct_60s / activeSymbols.size).toFixed(2));
-    }
     res.json(result);
-});
-
-app.get('/api/status', (req, res) => {
-    res.redirect(307, '/api/health');
 });
 
 app.get('/api/exchange-info', async (req, res) => {
@@ -1063,11 +744,8 @@ app.post('/api/execution/symbol', async (req, res) => {
 
 app.post('/api/execution/settings', async (req, res) => {
     const settings = await orchestrator.updateCapitalSettings({
-        starting_margin_usdt: Number(req.body?.starting_margin_usdt),
+        initialTradingBalance: Number(req.body?.initialTradingBalance),
         leverage: Number(req.body?.leverage),
-        ramp_step_pct: Number(req.body?.ramp_step_pct),
-        ramp_decay_pct: Number(req.body?.ramp_decay_pct),
-        ramp_max_mult: Number(req.body?.ramp_max_mult),
     });
     res.json({ ok: true, settings, status: orchestrator.getExecutionStatus() });
 });
@@ -1095,10 +773,7 @@ wss.on('connection', (wc, req) => {
     syms.forEach(s => {
         // Trigger initial seed if needed
         const ob = getOrderbook(s);
-        if (ob.uiState === 'INIT') {
-            transitionOrderbookState(s, 'SNAPSHOT_PENDING', 'client_subscribe_init');
-            fetchSnapshot(s, 'client_subscribe_init', true);
-        }
+        if (ob.uiState === 'UNSEEDED') fetchSnapshot(s);
     });
 
     updateStreams();
@@ -1112,28 +787,14 @@ wss.on('connection', (wc, req) => {
 
 // Reset 10s counters
 setInterval(() => {
-    const now = Date.now();
-    symbolMeta.forEach((meta, symbol) => {
+    symbolMeta.forEach(meta => {
         meta.depthMsgCount10s = 0;
         meta.metricsBroadcastCount10s = 0;
         meta.metricsBroadcastDepthCount10s = 0;
         meta.metricsBroadcastTradeCount10s = 0;
         meta.applyCount10s = 0;
-        const desyncRate10s = countWindow(meta.desyncEvents, 10000, now);
-        if (desyncRate10s > LIVE_DESYNC_RATE_10S_MAX) {
-            transitionOrderbookState(symbol, 'RESYNCING', 'desync_rate_high', { desyncRate10s });
-            fetchSnapshot(symbol, 'desync_rate_high', true).catch(() => { });
-        }
     });
 }, 10000);
-
-setInterval(() => {
-    activeSymbols.forEach((symbol) => {
-        evaluateLiveReadiness(symbol);
-        emitBlockedReasonTelemetry(symbol);
-    });
-    runAutoScaler();
-}, 1000);
 
 server.listen(PORT, HOST, () => log('SERVER_UP', { port: PORT, host: HOST }));
 orchestrator.start().catch((e) => {
