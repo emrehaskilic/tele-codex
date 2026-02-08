@@ -30,10 +30,18 @@ export interface SymbolActorDeps {
     invariantViolated: boolean;
     invariantReason: string | null;
     dataGaps: string[];
+    initialTradingBalance: number;
+    effectiveLeverage: number;
+    unrealizedPnlPeak: number | null;
+    profitLockActivated: boolean;
+    hardStopPrice: number | null;
+    exitReason: 'profit_lock' | 'hard_stop' | 'liquidation' | null;
     state: SymbolState;
   }) => void;
   onExecutionLogged: (event: ExecutionEvent | (ExecutionEvent & { slippage_bps?: number; execution_latency_ms?: number }), state: SymbolState) => void;
   getExpectedOrderMeta: (orderId: string) => { expectedPrice: number | null; sentAtMs: number; tag: 'entry' | 'add' | 'exit' } | null;
+  getInitialTradingBalance: () => number;
+  getEffectiveLeverage: () => number;
   markAddUsed: () => void;
   cooldownConfig: { minMs: number; maxMs: number };
 }
@@ -142,6 +150,13 @@ export class SymbolActor {
         : envelope.gate.mode === GateMode.V1_NO_LATENCY
         ? 'DEGRADED'
         : 'NORMAL';
+    const exitReason = actions.some((a) => a.reason === 'profit_lock_exit')
+      ? 'profit_lock'
+      : actions.some((a) => a.reason === 'emergency_exit_hard_stop')
+      ? 'hard_stop'
+      : actions.some((a) => a.reason === 'emergency_exit_liquidation_risk')
+      ? 'liquidation'
+      : null;
 
     this.deps.onDecisionLogged({
       symbol: envelope.symbol,
@@ -158,6 +173,12 @@ export class SymbolActor {
       invariantViolated,
       invariantReason,
       dataGaps,
+      initialTradingBalance: this.deps.getInitialTradingBalance(),
+      effectiveLeverage: this.deps.getEffectiveLeverage(),
+      unrealizedPnlPeak: this.state.position?.peakPnlPct ?? null,
+      profitLockActivated: Boolean(this.state.position?.profitLockActivated),
+      hardStopPrice: this.state.position?.hardStopPrice ?? null,
+      exitReason,
       state: this.snapshotState(),
     });
 
@@ -255,6 +276,7 @@ export class SymbolActor {
         this.state.position = null;
       } else {
         const side = event.positionAmt > 0 ? 'LONG' : 'SHORT';
+        const sideChanged = this.state.position?.side && this.state.position.side !== side;
         const prevPeak = this.state.position?.peakPnlPct ?? event.unrealizedPnL;
         this.state.position = {
           side,
@@ -263,6 +285,8 @@ export class SymbolActor {
           unrealizedPnlPct: event.unrealizedPnL,
           addsUsed: this.state.position?.addsUsed ?? 0,
           peakPnlPct: Math.max(prevPeak, event.unrealizedPnL),
+          profitLockActivated: sideChanged ? false : (this.state.position?.profitLockActivated ?? false),
+          hardStopPrice: sideChanged ? null : (this.state.position?.hardStopPrice ?? null),
         };
       }
 

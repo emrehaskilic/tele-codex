@@ -45,10 +45,12 @@ function baseState(): SymbolState {
 
 const engine = new DecisionEngine({
   expectedPrice: () => 100,
-  getRiskPerTradePercent: () => 10,
+  getSizingBalance: () => 100,
   getMaxLeverage: () => 20,
   hardStopLossPct: 1.0,
   liquidationEmergencyMarginRatio: 0.30,
+  takerFeeBps: 4,
+  profitLockBufferBps: 2,
 });
 
 export function runTests() {
@@ -62,6 +64,8 @@ export function runTests() {
       unrealizedPnlPct: -0.1,
       addsUsed: 0,
       peakPnlPct: 0,
+      profitLockActivated: false,
+      hardStopPrice: null,
     };
     state.execQuality.quality = 'UNKNOWN';
     state.execQuality.freezeActive = true;
@@ -93,6 +97,8 @@ export function runTests() {
       unrealizedPnlPct: -0.2,
       addsUsed: 0,
       peakPnlPct: 0,
+      profitLockActivated: false,
+      hardStopPrice: null,
     };
     state.execQuality.quality = 'BAD';
     state.execQuality.freezeActive = true;
@@ -125,6 +131,8 @@ export function runTests() {
       unrealizedPnlPct: -0.1,
       addsUsed: 0,
       peakPnlPct: 0,
+      profitLockActivated: false,
+      hardStopPrice: null,
     };
     state.execQuality.quality = 'UNKNOWN';
     state.execQuality.freezeActive = true;
@@ -156,6 +164,8 @@ export function runTests() {
       unrealizedPnlPct: -2.5,
       addsUsed: 0,
       peakPnlPct: 0,
+      profitLockActivated: false,
+      hardStopPrice: null,
     };
     state.execQuality.quality = 'BAD';
     state.execQuality.freezeActive = true;

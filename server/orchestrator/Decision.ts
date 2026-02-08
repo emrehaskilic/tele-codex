@@ -1,13 +1,15 @@
 import { DecisionAction, GateResult, OrchestratorMetricsInput, SymbolState } from './types';
-import { hardStopTriggered } from './HardStopGuard';
+import { evaluateHardStop } from './HardStopGuard';
 import { liquidationRiskTriggered } from './LiquidationGuard';
 
 export interface DecisionDependencies {
   expectedPrice: (symbol: string, side: 'BUY' | 'SELL', type: 'MARKET' | 'LIMIT', limitPrice?: number) => number | null;
-  getRiskPerTradePercent: () => number;
+  getSizingBalance: (symbol: string, availableBalance: number) => number;
   getMaxLeverage: () => number;
   hardStopLossPct: number;
   liquidationEmergencyMarginRatio: number;
+  takerFeeBps: number;
+  profitLockBufferBps: number;
 }
 
 export class DecisionEngine {
@@ -34,13 +36,19 @@ export class DecisionEngine {
     const freezeActive = state.execQuality.freezeActive;
 
     const inCooldown = event_time_ms < state.cooldown_until_ms;
+    const marketPrice = this.resolveMarketPrice(metrics, state.position?.side || null);
+    this.activateProfitLockIfEligible(state, marketPrice);
+
     const liquidationTriggered = liquidationRiskTriggered(state, {
       emergencyMarginRatio: this.deps.liquidationEmergencyMarginRatio,
     });
-    const hardStop = hardStopTriggered(state, { maxLossPct: this.deps.hardStopLossPct });
+    const hardStopEvaluation = evaluateHardStop(state, { maxLossPct: this.deps.hardStopLossPct }, marketPrice);
+
     const emergencyReason = liquidationTriggered
       ? 'emergency_exit_liquidation_risk'
-      : hardStop
+      : hardStopEvaluation.profitLockTriggered
+      ? 'profit_lock_exit'
+      : hardStopEvaluation.hardStopTriggered
       ? 'emergency_exit_hard_stop'
       : null;
 
@@ -60,6 +68,7 @@ export class DecisionEngine {
           const price = this.deps.expectedPrice(symbol, side, 'MARKET');
           if (price && price > 0) {
             const probeQuantity = this.computeProbeQuantity({
+              symbol,
               availableBalance: state.availableBalance,
               expectedPrice: price,
               deltaZ,
@@ -123,6 +132,7 @@ export class DecisionEngine {
       const price = this.deps.expectedPrice(symbol, side, 'MARKET');
       if (price && price > 0) {
         const qty = this.computeProbeQuantity({
+            symbol,
             availableBalance: state.availableBalance,
             expectedPrice: price,
             deltaZ,
@@ -166,18 +176,17 @@ export class DecisionEngine {
   }
 
   private computeProbeQuantity(input: {
+    symbol: string;
     availableBalance: number;
     expectedPrice: number;
     deltaZ: number;
     obiDeep: number;
     execPoor: boolean;
   }): number {
-    const walletUsagePercent = this.deps.getRiskPerTradePercent(); // Actually walletUsagePercent from UI
+    const sizingBalance = this.deps.getSizingBalance(input.symbol, input.availableBalance);
     const leverage = this.deps.getMaxLeverage();
 
-    // Direct calculation: use walletUsagePercent of available balance with leverage
-    const usableBalance = (input.availableBalance * walletUsagePercent) / 100;
-    const notional = usableBalance * leverage;
+    const notional = sizingBalance * leverage;
     const qty = notional / input.expectedPrice;
 
     if (!Number.isFinite(qty) || qty <= 0) {
@@ -185,5 +194,46 @@ export class DecisionEngine {
     }
 
     return Number(qty.toFixed(6));
+  }
+
+  private resolveMarketPrice(metrics: OrchestratorMetricsInput, positionSide: 'LONG' | 'SHORT' | null): number | null {
+    if (positionSide === 'LONG') {
+      const px = metrics.best_bid ?? metrics.best_ask ?? null;
+      return typeof px === 'number' && Number.isFinite(px) ? px : null;
+    }
+    if (positionSide === 'SHORT') {
+      const px = metrics.best_ask ?? metrics.best_bid ?? null;
+      return typeof px === 'number' && Number.isFinite(px) ? px : null;
+    }
+    const bid = metrics.best_bid;
+    const ask = metrics.best_ask;
+    if (typeof bid === 'number' && Number.isFinite(bid) && typeof ask === 'number' && Number.isFinite(ask) && bid > 0 && ask > 0) {
+      return (bid + ask) / 2;
+    }
+    return null;
+  }
+
+  private activateProfitLockIfEligible(state: SymbolState, marketPrice: number | null) {
+    if (!state.position) {
+      return;
+    }
+    if (state.position.profitLockActivated) {
+      return;
+    }
+    if (state.position.unrealizedPnlPct < 0.30) {
+      return;
+    }
+    if (!(typeof marketPrice === 'number' && Number.isFinite(marketPrice) && marketPrice > 0)) {
+      return;
+    }
+
+    const feeAndBufferBps = (this.deps.takerFeeBps * 2) + this.deps.profitLockBufferBps;
+    const multiplier = feeAndBufferBps / 10_000;
+    const stop = state.position.side === 'LONG'
+      ? state.position.entryPrice * (1 + multiplier)
+      : state.position.entryPrice * (1 - multiplier);
+
+    state.position.hardStopPrice = Number(stop.toFixed(8));
+    state.position.profitLockActivated = true;
   }
 }

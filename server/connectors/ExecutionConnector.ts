@@ -97,12 +97,14 @@ export class ExecutionConnector {
   private serverTimeOffsetMs = 0;
   private dualSidePosition: boolean | null = null;
   private exchangeInfoLoaded = false;
+  private preferredLeverage: number;
 
   constructor(config: ExecutionConnectorConfig) {
     this.config = config;
     this.apiKey = config.apiKey;
     this.apiSecret = config.apiSecret;
     this.executionEnabled = config.enabled;
+    this.preferredLeverage = Math.max(1, Math.trunc(config.defaultLeverage || 20));
   }
 
   onExecutionEvent(listener: ExecutionListener) {
@@ -148,6 +150,18 @@ export class ExecutionConnector {
 
   isConnected(): boolean {
     return this.state === 'CONNECTED';
+  }
+
+  setPreferredLeverage(leverage: number) {
+    if (!Number.isFinite(leverage) || leverage <= 0) {
+      return;
+    }
+    this.preferredLeverage = Math.max(1, Math.trunc(leverage));
+    this.emitStatus();
+  }
+
+  getPreferredLeverage(): number {
+    return this.preferredLeverage;
   }
 
   setCredentials(apiKey: string, apiSecret: string) {
@@ -363,6 +377,7 @@ export class ExecutionConnector {
         baseUrl: this.config.restBaseUrl,
         path: '/fapi/v1/order',
         params,
+        effective_leverage: this.preferredLeverage,
       },
     });
 
@@ -524,6 +539,42 @@ export class ExecutionConnector {
       .filter((s: any) => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT')
       .map((s: any) => String(s.symbol))
       .sort();
+  }
+
+  async fetchRealizedPnlBySymbol(symbols: string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    const normalized = new Set(symbols.map((s) => s.toUpperCase()));
+    if (!this.apiKey || !this.apiSecret || normalized.size === 0) {
+      return out;
+    }
+
+    const income = await this.signedRequest({
+      path: '/fapi/v1/income',
+      method: 'GET',
+      requiresAuth: true,
+      params: {
+        incomeType: 'REALIZED_PNL',
+        limit: 1000,
+      },
+    });
+
+    if (!Array.isArray(income)) {
+      return out;
+    }
+
+    for (const item of income) {
+      const symbol = String(item?.symbol || '').toUpperCase();
+      if (!normalized.has(symbol)) {
+        continue;
+      }
+      const value = Number(item?.income || 0);
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      out.set(symbol, (out.get(symbol) || 0) + value);
+    }
+
+    return out;
   }
 
   async ensureSymbolsReady() {
@@ -866,13 +917,39 @@ export class ExecutionConnector {
       throw new Error(`symbol_not_in_testnet_exchange_info:${symbol}`);
     }
 
-    const leverage = Math.max(1, Math.trunc(this.config.defaultLeverage || 20));
-    await this.signedRequest({
+    const leverage = this.preferredLeverage;
+    const leverageResponse = await this.signedRequest({
       path: '/fapi/v1/leverage',
       method: 'POST',
       requiresAuth: true,
       params: { symbol, leverage },
     });
+    const effectiveLeverage = Number(leverageResponse?.leverage || leverage);
+    this.emitDebug({
+      channel: 'execution',
+      type: 'request_debug',
+      symbol,
+      ts: Date.now(),
+      payload: {
+        type: 'effective_leverage',
+        requested: leverage,
+        effective: effectiveLeverage,
+      },
+    });
+    if (Number.isFinite(effectiveLeverage) && effectiveLeverage !== leverage) {
+      this.emitDebug({
+        channel: 'execution',
+        type: 'request_error',
+        symbol,
+        ts: Date.now(),
+        payload: {
+          error_class: 'leverage_mismatch_warning',
+          requested: leverage,
+          effective: effectiveLeverage,
+          message: 'exchange_effective_leverage_differs_from_user_setting',
+        },
+      });
+    }
 
     const marginType: MarginType = this.config.defaultMarginType || 'ISOLATED';
     try {

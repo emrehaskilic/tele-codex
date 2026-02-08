@@ -742,13 +742,21 @@ app.post('/api/execution/symbol', async (req, res) => {
     }
 });
 
-app.post('/api/execution/settings', (req, res) => {
-    const settings = orchestrator.updateCapitalSettings({
-        initialBalanceUsdt: Number(req.body?.initialBalanceUsdt),
-        walletUsagePercent: Number(req.body?.walletUsagePercent),
+app.post('/api/execution/settings', async (req, res) => {
+    const settings = await orchestrator.updateCapitalSettings({
+        initialTradingBalance: Number(req.body?.initialTradingBalance),
         leverage: Number(req.body?.leverage),
     });
     res.json({ ok: true, settings, status: orchestrator.getExecutionStatus() });
+});
+
+app.post('/api/execution/refresh', async (req, res) => {
+    try {
+        const status = await orchestrator.refreshExecutionState();
+        res.json({ ok: true, status });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e.message || 'execution_refresh_failed' });
+    }
 });
 
 const server = createServer(app);

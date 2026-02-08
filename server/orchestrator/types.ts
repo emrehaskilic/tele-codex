@@ -79,6 +79,8 @@ export interface PositionState {
   unrealizedPnlPct: number;
   addsUsed: number;
   peakPnlPct: number;
+  profitLockActivated: boolean;
+  hardStopPrice: number | null;
 }
 
 export type ExecQualityLevel = 'GOOD' | 'BAD' | 'UNKNOWN';
@@ -142,6 +144,12 @@ export interface DecisionRecord {
   invariant_violated: boolean;
   invariant_reason: string | null;
   data_gaps: string[];
+  initial_trading_balance: number;
+  effective_leverage: number;
+  unrealized_pnl_peak: number | null;
+  profit_lock_activated: boolean;
+  hard_stop_price: number | null;
+  exit_reason: 'profit_lock' | 'hard_stop' | 'liquidation' | null;
   stateSnapshot: {
     halted: boolean;
     availableBalance: number;
@@ -154,10 +162,12 @@ export interface DecisionRecord {
 
 export interface OrchestratorConfig {
   gate: GateConfig;
-  riskPerTradePercent: number;
+  initialTradingBalance: number;
   maxLeverage: number;
   hardStopLossPct: number;
   liquidationEmergencyMarginRatio: number;
+  takerFeeBps: number;
+  profitLockBufferBps: number;
   cooldownMinMs: number;
   cooldownMaxMs: number;
   loggerQueueLimit: number;

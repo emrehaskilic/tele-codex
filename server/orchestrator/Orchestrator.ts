@@ -26,8 +26,7 @@ export class Orchestrator {
   private readonly realizedPnlBySymbol = new Map<string, number>();
 
   private capitalSettings = {
-    initialBalanceUsdt: 1000,
-    walletUsagePercent: 10,
+    initialTradingBalance: 100,
     leverage: 10,
   };
 
@@ -35,15 +34,18 @@ export class Orchestrator {
     private readonly connector: ExecutionConnector,
     private readonly config: OrchestratorConfig
   ) {
-    this.capitalSettings.walletUsagePercent = config.riskPerTradePercent;
-    this.capitalSettings.leverage = Math.min(this.capitalSettings.leverage, config.maxLeverage);
+    this.capitalSettings.initialTradingBalance = Math.max(0, config.initialTradingBalance);
+    this.capitalSettings.leverage = Math.min(this.connector.getPreferredLeverage(), config.maxLeverage);
+    this.connector.setPreferredLeverage(this.capitalSettings.leverage);
 
     this.decisionEngine = new DecisionEngine({
       expectedPrice: (symbol, side, type, limitPrice) => this.connector.expectedPrice(symbol, side, type, limitPrice),
-      getRiskPerTradePercent: () => this.capitalSettings.walletUsagePercent,
+      getSizingBalance: (symbol, availableBalance) => this.resolveSizingBalance(symbol, availableBalance),
       getMaxLeverage: () => this.capitalSettings.leverage,
       hardStopLossPct: this.config.hardStopLossPct,
       liquidationEmergencyMarginRatio: this.config.liquidationEmergencyMarginRatio,
+      takerFeeBps: this.config.takerFeeBps,
+      profitLockBufferBps: this.config.profitLockBufferBps,
     });
 
     this.logger = new OrchestratorLogger({
@@ -279,15 +281,16 @@ export class Orchestrator {
     };
   }
 
-  updateCapitalSettings(input: { initialBalanceUsdt?: number; walletUsagePercent?: number; leverage?: number }) {
-    if (typeof input.initialBalanceUsdt === 'number' && Number.isFinite(input.initialBalanceUsdt) && input.initialBalanceUsdt >= 0) {
-      this.capitalSettings.initialBalanceUsdt = input.initialBalanceUsdt;
-    }
-    if (typeof input.walletUsagePercent === 'number' && Number.isFinite(input.walletUsagePercent) && input.walletUsagePercent >= 0 && input.walletUsagePercent <= 100) {
-      this.capitalSettings.walletUsagePercent = input.walletUsagePercent;
+  async updateCapitalSettings(input: { initialTradingBalance?: number; leverage?: number }) {
+    if (typeof input.initialTradingBalance === 'number' && Number.isFinite(input.initialTradingBalance) && input.initialTradingBalance >= 0) {
+      this.capitalSettings.initialTradingBalance = input.initialTradingBalance;
     }
     if (typeof input.leverage === 'number' && Number.isFinite(input.leverage) && input.leverage > 0) {
       this.capitalSettings.leverage = Math.min(input.leverage, this.config.maxLeverage);
+      this.connector.setPreferredLeverage(this.capitalSettings.leverage);
+      if (this.connector.isConnected() && this.executionSymbols.size > 0) {
+        await this.connector.ensureSymbolsReady();
+      }
     }
     return this.capitalSettings;
   }
@@ -310,6 +313,18 @@ export class Orchestrator {
 
   async listTestnetFuturesPairs() {
     return this.connector.fetchTestnetFuturesPairs();
+  }
+
+  async refreshExecutionState() {
+    if (this.executionSymbols.size > 0) {
+      const realizedSnapshot = await this.connector.fetchRealizedPnlBySymbol(Array.from(this.executionSymbols));
+      for (const [symbol, realized] of realizedSnapshot) {
+        this.realizedPnlBySymbol.set(symbol, realized);
+      }
+    }
+    await this.connector.syncState();
+    await this.flush();
+    return this.getExecutionStatus();
   }
 
   async setExecutionSymbols(symbols: string[]) {
@@ -362,6 +377,12 @@ export class Orchestrator {
         invariantViolated,
         invariantReason,
         dataGaps,
+        initialTradingBalance,
+        effectiveLeverage,
+        unrealizedPnlPeak,
+        profitLockActivated,
+        hardStopPrice,
+        exitReason,
         state,
       }) => {
         const record: DecisionRecord = {
@@ -379,6 +400,12 @@ export class Orchestrator {
           invariant_violated: invariantViolated,
           invariant_reason: invariantReason,
           data_gaps: dataGaps,
+          initial_trading_balance: initialTradingBalance,
+          effective_leverage: effectiveLeverage,
+          unrealized_pnl_peak: unrealizedPnlPeak,
+          profit_lock_activated: profitLockActivated,
+          hard_stop_price: hardStopPrice,
+          exit_reason: exitReason,
           stateSnapshot: {
             halted: state.halted,
             availableBalance: state.availableBalance,
@@ -410,10 +437,17 @@ export class Orchestrator {
             position: state.position,
             execQuality: state.execQuality,
             marginRatio: state.marginRatio,
+            initial_trading_balance: this.capitalSettings.initialTradingBalance,
+            effective_leverage: this.capitalSettings.leverage,
+            unrealized_pnl_peak: state.position?.peakPnlPct ?? null,
+            profit_lock_activated: state.position?.profitLockActivated ?? false,
+            hard_stop_price: state.position?.hardStopPrice ?? null,
           },
         });
       },
       getExpectedOrderMeta: (orderId) => this.expectedByOrderId.get(orderId) || null,
+      getInitialTradingBalance: () => this.capitalSettings.initialTradingBalance,
+      getEffectiveLeverage: () => this.capitalSettings.leverage,
       markAddUsed: () => {
         // no-op
       },
@@ -528,6 +562,13 @@ export class Orchestrator {
   private clientOrderId(tag: string, symbol: string, eventTimeMs: number): string {
     return `${tag}_${symbol}_${eventTimeMs}`.slice(0, 36);
   }
+
+  private resolveSizingBalance(symbol: string, availableBalance: number): number {
+    const base = Math.max(0, this.capitalSettings.initialTradingBalance);
+    const realized = Math.max(0, this.realizedPnlBySymbol.get(symbol) || 0);
+    const target = base + realized;
+    return Math.max(0, Math.min(availableBalance, target));
+  }
 }
 
 export function createOrchestratorFromEnv(): Orchestrator {
@@ -558,10 +599,12 @@ export function createOrchestratorFromEnv(): Orchestrator {
         maxNetworkLatencyMs: Number(process.env.MAX_NETWORK_LATENCY_MS || 1500),
       },
     },
-    riskPerTradePercent: Number(process.env.RISK_PER_TRADE_PERCENT || 0.5),
+    initialTradingBalance: Number(process.env.INITIAL_TRADING_BALANCE || 100),
     maxLeverage: Number(process.env.MAX_LEVERAGE || 100),
     hardStopLossPct: Number(process.env.HARD_STOP_LOSS_PCT || 1.0),
     liquidationEmergencyMarginRatio: Number(process.env.LIQUIDATION_EMERGENCY_MARGIN_RATIO || 0.30),
+    takerFeeBps: Number(process.env.TAKER_FEE_BPS || 4),
+    profitLockBufferBps: Number(process.env.PROFIT_LOCK_BUFFER_BPS || 2),
     cooldownMinMs: Number(process.env.COOLDOWN_MIN_MS || 2000),
     cooldownMaxMs: Number(process.env.COOLDOWN_MAX_MS || 30000),
     loggerQueueLimit: Number(process.env.LOGGER_QUEUE_LIMIT || 5000),

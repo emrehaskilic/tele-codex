@@ -17,8 +17,7 @@ interface ExecutionStatus {
   selectedSymbol?: string | null; // Legacy
   selectedSymbols: string[]; // New
   settings: {
-    initialBalanceUsdt: number;
-    walletUsagePercent: number;
+    initialTradingBalance: number;
     leverage: number;
   };
   wallet: {
@@ -53,8 +52,7 @@ const defaultExecutionStatus: ExecutionStatus = {
   selectedSymbol: null,
   selectedSymbols: [],
   settings: {
-    initialBalanceUsdt: 1000,
-    walletUsagePercent: 10,
+    initialTradingBalance: 100,
     leverage: 10,
   },
   wallet: {
@@ -82,8 +80,7 @@ export const Dashboard: React.FC = () => {
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // Settings inputs - initialize with defaults, only update from server on first load/explicit sync
-  const [initialBalanceInput, setInitialBalanceInput] = useState<string>('1000');
-  const [walletUsageInput, setWalletUsageInput] = useState<string>('10');
+  const [initialBalanceInput, setInitialBalanceInput] = useState<string>('100');
   const [leverageInput, setLeverageInput] = useState<string>('10');
   const settingsLoadedRef = React.useRef(false);
 
@@ -124,8 +121,7 @@ export const Dashboard: React.FC = () => {
 
         // Sync local settings only if not yet loaded (prevents overwrite while typing)
         if (!settingsLoadedRef.current && data.settings) {
-          setInitialBalanceInput(String(data.settings.initialBalanceUsdt));
-          setWalletUsageInput(String(data.settings.walletUsagePercent));
+          setInitialBalanceInput(String(data.settings.initialTradingBalance));
           setLeverageInput(String(data.settings.leverage));
           settingsLoadedRef.current = true;
 
@@ -281,8 +277,7 @@ export const Dashboard: React.FC = () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        initialBalanceUsdt: Number(initialBalanceInput) || 1000,
-        walletUsagePercent: Number(walletUsageInput) || 10,
+        initialTradingBalance: Number(initialBalanceInput) || 100,
         leverage: Number(leverageInput) || 1
       }),
     });
@@ -291,10 +286,20 @@ export const Dashboard: React.FC = () => {
       setExecutionStatus(data.status as ExecutionStatus);
       // Update inputs to reflect any server-side clamping/validation results
       if (data.settings) {
-        setInitialBalanceInput(String(data.settings.initialBalanceUsdt));
-        setWalletUsageInput(String(data.settings.walletUsagePercent));
+        setInitialBalanceInput(String(data.settings.initialTradingBalance));
         setLeverageInput(String(data.settings.leverage));
       }
+    }
+  };
+
+  const refreshWalletPnl = async () => {
+    const res = await fetch(`${proxyUrl}/api/execution/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await res.json();
+    if (res.ok) {
+      setExecutionStatus(data.status as ExecutionStatus);
     }
   };
 
@@ -425,20 +430,11 @@ export const Dashboard: React.FC = () => {
 
           <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 space-y-3">
             <h2 className="text-sm font-semibold text-zinc-300">Risk & Capital</h2>
-            <label className="text-xs text-zinc-400 block">Initial Balance (USDT)</label>
+            <label className="text-xs text-zinc-400 block">Initial Trading Balance (USDT)</label>
             <input
               type="number"
               value={initialBalanceInput}
               onChange={(e) => setInitialBalanceInput(e.target.value)}
-              className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
-            />
-            <label className="text-xs text-zinc-400 block">Wallet Usage (%)</label>
-            <input
-              type="number"
-              min={0}
-              max={100}
-              value={walletUsageInput}
-              onChange={(e) => setWalletUsageInput(e.target.value)}
               className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
             />
             <label className="text-xs text-zinc-400 block">Leverage (no hard cap, env MAX_LEVERAGE applies)</label>
@@ -455,8 +451,17 @@ export const Dashboard: React.FC = () => {
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
-            <h2 className="text-sm font-semibold text-zinc-300 mb-2">Wallet & PnL (Testnet Execution Events)</h2>
+            <div className="mb-2 flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-zinc-300">Wallet & PnL (Testnet Execution Events)</h2>
+              <button
+                onClick={refreshWalletPnl}
+                className="rounded border border-zinc-700 px-2 py-1 text-[11px] text-zinc-300 hover:bg-zinc-800"
+              >
+                Refresh
+              </button>
+            </div>
             <div className="grid grid-cols-2 gap-y-2 text-xs">
+              <div className="text-zinc-500">Initial Trading Balance</div><div className="text-right font-mono">{formatNum(executionStatus.settings.initialTradingBalance)} USDT</div>
               <div className="text-zinc-500">Total Wallet</div><div className="text-right font-mono">{formatNum(executionStatus.wallet.totalWalletUsdt)} USDT</div>
               <div className="text-zinc-500">Available</div><div className="text-right font-mono">{formatNum(executionStatus.wallet.availableBalanceUsdt)} USDT</div>
               <div className="text-zinc-500">Realized PnL</div><div className={`text-right font-mono ${executionStatus.wallet.realizedPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{formatNum(executionStatus.wallet.realizedPnl)}</div>

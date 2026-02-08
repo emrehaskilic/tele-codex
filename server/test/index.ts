@@ -15,6 +15,7 @@ import * as ReconnectTests from './ReconnectContinuity.test';
 import * as LegacyTests from './LegacyCalculator.test';
 import * as GateTests from './Gate.test';
 import * as FreezePolicyTests from './FreezeEmergencyPolicy.test';
+import * as ProfitLockTests from './ProfitLock.test';
 
 // Minimal test harness: runs each runTests() and prints summary
 const testSuites: { name: string; fn: () => void }[] = [
@@ -30,6 +31,7 @@ const testSuites: { name: string; fn: () => void }[] = [
   { name: 'LegacyCalculator', fn: LegacyTests.runTests },
   { name: 'Gate', fn: GateTests.runTests },
   { name: 'FreezeEmergencyPolicy', fn: FreezePolicyTests.runTests },
+  { name: 'ProfitLock', fn: ProfitLockTests.runTests },
 ];
 
 let total = 0;
