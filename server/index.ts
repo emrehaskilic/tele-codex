@@ -919,6 +919,13 @@ app.get('/api/health', (req, res) => {
         uptime: Math.floor(process.uptime()),
         ws: { state: wsState, count: activeSymbols.size },
         globalBackoff: Math.max(0, globalBackoffUntil - now),
+        summary: {
+            desync_count_10s: 0,
+            desync_count_60s: 0,
+            snapshot_ok_count_60s: 0,
+            snapshot_skip_count_60s: 0,
+            live_uptime_pct_60s: 0,
+        },
         symbols: {}
     };
 
@@ -966,7 +973,15 @@ app.get('/api/health', (req, res) => {
             backoff: meta.backoffMs,
             trades: meta.tradeMsgCount
         };
+        result.summary.desync_count_10s += desync10s;
+        result.summary.desync_count_60s += desync60s;
+        result.summary.snapshot_ok_count_60s += snapshotOk60s;
+        result.summary.snapshot_skip_count_60s += snapshotSkip60s;
+        result.summary.live_uptime_pct_60s += livePct60s;
     });
+    if (activeSymbols.size > 0) {
+        result.summary.live_uptime_pct_60s = Number((result.summary.live_uptime_pct_60s / activeSymbols.size).toFixed(2));
+    }
     res.json(result);
 });
 
