@@ -742,8 +742,8 @@ app.post('/api/execution/symbol', async (req, res) => {
     }
 });
 
-app.post('/api/execution/settings', (req, res) => {
-    const settings = orchestrator.updateCapitalSettings({
+app.post('/api/execution/settings', async (req, res) => {
+    const settings = await orchestrator.updateCapitalSettings({
         initialBalanceUsdt: Number(req.body?.initialBalanceUsdt),
         walletUsagePercent: Number(req.body?.walletUsagePercent),
         leverage: Number(req.body?.leverage),

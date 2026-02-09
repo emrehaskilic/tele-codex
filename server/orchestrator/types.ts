@@ -117,6 +117,8 @@ export interface DecisionAction {
   reduceOnly?: boolean;
   reason: string;
   expectedPrice?: number | null;
+  targetMarginUsdt?: number;
+  targetNotionalUsdt?: number;
 }
 
 export interface DecisionRecord {

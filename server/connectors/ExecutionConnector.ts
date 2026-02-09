@@ -51,6 +51,7 @@ export interface ExecutionConnectorStatus {
   readyReason: string | null;
   serverTimeOffsetMs: number;
   dualSidePosition: boolean | null;
+  effectiveLeverageBySymbol: Record<string, number>;
   updatedAtMs: number;
 }
 
@@ -63,7 +64,8 @@ export interface ExecutionDebugEvent {
   | 'request_debug'
   | 'request_error'
   | 'why_not_sent'
-  | 'readiness';
+  | 'readiness'
+  | 'margin_type';
   order_attempt_id?: string;
   decision_id?: string;
   symbol?: string;
@@ -78,6 +80,7 @@ export class ExecutionConnector {
   private readonly debugListeners = new Set<DebugListener>();
   private readonly symbols = new Set<string>();
   private readonly quotes = new Map<string, TestnetQuote>();
+  private readonly effectiveLeverageBySymbol = new Map<string, number>();
   private readonly readyBySymbol = new Map<string, { ready: boolean; reason: string | null }>();
   private readonly symbolRules = new Map<string, SymbolRules>();
 
@@ -133,6 +136,7 @@ export class ExecutionConnector {
       readyReason: readiness.reason,
       serverTimeOffsetMs: this.serverTimeOffsetMs,
       dualSidePosition: this.dualSidePosition,
+      effectiveLeverageBySymbol: Object.fromEntries(this.effectiveLeverageBySymbol.entries()),
       updatedAtMs: Date.now(),
     };
   }
@@ -144,6 +148,12 @@ export class ExecutionConnector {
   setExecutionEnabled(enabled: boolean) {
     this.executionEnabled = Boolean(enabled);
     this.emitStatus();
+  }
+
+  setDefaultLeverage(leverage: number) {
+    if (Number.isFinite(leverage) && leverage > 0) {
+      this.config.defaultLeverage = Math.max(1, Math.trunc(leverage));
+    }
   }
 
   isConnected(): boolean {
@@ -169,6 +179,7 @@ export class ExecutionConnector {
   setSymbols(symbols: string[]) {
     this.symbols.clear();
     this.readyBySymbol.clear();
+    this.effectiveLeverageBySymbol.clear();
     for (const symbol of symbols) {
       this.symbols.add(symbol.toUpperCase());
     }
@@ -867,12 +878,18 @@ export class ExecutionConnector {
     }
 
     const leverage = Math.max(1, Math.trunc(this.config.defaultLeverage || 20));
-    await this.signedRequest({
+    const leverageResponse = await this.signedRequest({
       path: '/fapi/v1/leverage',
       method: 'POST',
       requiresAuth: true,
       params: { symbol, leverage },
     });
+    const effectiveLeverage = Number(leverageResponse?.leverage);
+    if (Number.isFinite(effectiveLeverage) && effectiveLeverage > 0) {
+      this.effectiveLeverageBySymbol.set(symbol, effectiveLeverage);
+    } else {
+      this.effectiveLeverageBySymbol.delete(symbol);
+    }
 
     const marginType: MarginType = this.config.defaultMarginType || 'ISOLATED';
     try {
@@ -887,6 +904,17 @@ export class ExecutionConnector {
       if (code !== -4046) {
         throw error;
       }
+      this.emitDebug({
+        channel: 'execution',
+        type: 'margin_type',
+        symbol,
+        ts: Date.now(),
+        payload: {
+          message: 'margin_type_already_set',
+          marginType,
+          binanceCode: code,
+        },
+      });
     }
   }
 

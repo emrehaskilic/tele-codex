@@ -13,12 +13,12 @@ interface ExecutionStatus {
     hasCredentials: boolean;
     symbols: string[];
     lastError: string | null;
+    effectiveLeverageBySymbol?: Record<string, number>;
   };
   selectedSymbol?: string | null; // Legacy
   selectedSymbols: string[]; // New
   settings: {
     initialBalanceUsdt: number;
-    walletUsagePercent: number;
     leverage: number;
   };
   wallet: {
@@ -54,7 +54,6 @@ const defaultExecutionStatus: ExecutionStatus = {
   selectedSymbols: [],
   settings: {
     initialBalanceUsdt: 1000,
-    walletUsagePercent: 10,
     leverage: 10,
   },
   wallet: {
@@ -83,7 +82,6 @@ export const Dashboard: React.FC = () => {
 
   // Settings inputs - initialize with defaults, only update from server on first load/explicit sync
   const [initialBalanceInput, setInitialBalanceInput] = useState<string>('1000');
-  const [walletUsageInput, setWalletUsageInput] = useState<string>('10');
   const [leverageInput, setLeverageInput] = useState<string>('10');
   const settingsLoadedRef = React.useRef(false);
 
@@ -125,7 +123,6 @@ export const Dashboard: React.FC = () => {
         // Sync local settings only if not yet loaded (prevents overwrite while typing)
         if (!settingsLoadedRef.current && data.settings) {
           setInitialBalanceInput(String(data.settings.initialBalanceUsdt));
-          setWalletUsageInput(String(data.settings.walletUsagePercent));
           setLeverageInput(String(data.settings.leverage));
           settingsLoadedRef.current = true;
 
@@ -282,7 +279,6 @@ export const Dashboard: React.FC = () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         initialBalanceUsdt: Number(initialBalanceInput) || 1000,
-        walletUsagePercent: Number(walletUsageInput) || 10,
         leverage: Number(leverageInput) || 1
       }),
     });
@@ -292,7 +288,6 @@ export const Dashboard: React.FC = () => {
       // Update inputs to reflect any server-side clamping/validation results
       if (data.settings) {
         setInitialBalanceInput(String(data.settings.initialBalanceUsdt));
-        setWalletUsageInput(String(data.settings.walletUsagePercent));
         setLeverageInput(String(data.settings.leverage));
       }
     }
@@ -425,20 +420,11 @@ export const Dashboard: React.FC = () => {
 
           <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 space-y-3">
             <h2 className="text-sm font-semibold text-zinc-300">Risk & Capital</h2>
-            <label className="text-xs text-zinc-400 block">Initial Balance (USDT)</label>
+            <label className="text-xs text-zinc-400 block">Initial Margin per Symbol (USDT)</label>
             <input
               type="number"
               value={initialBalanceInput}
               onChange={(e) => setInitialBalanceInput(e.target.value)}
-              className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
-            />
-            <label className="text-xs text-zinc-400 block">Wallet Usage (%)</label>
-            <input
-              type="number"
-              min={0}
-              max={100}
-              value={walletUsageInput}
-              onChange={(e) => setWalletUsageInput(e.target.value)}
               className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
             />
             <label className="text-xs text-zinc-400 block">Leverage (no hard cap, env MAX_LEVERAGE applies)</label>
@@ -449,6 +435,29 @@ export const Dashboard: React.FC = () => {
               onChange={(e) => setLeverageInput(e.target.value)}
               className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
             />
+            <div className="text-[11px] text-zinc-500">
+              Requested leverage: <span className="text-zinc-300">{formatNum(executionStatus.settings.leverage, 0)}x</span>
+            </div>
+            <div className="text-[11px] text-zinc-500">
+              Effective leverage (testnet):{' '}
+              {executionStatus.connection.effectiveLeverageBySymbol &&
+              Object.keys(executionStatus.connection.effectiveLeverageBySymbol).length > 0 ? (
+                <span className="text-zinc-300">
+                  {Object.entries(executionStatus.connection.effectiveLeverageBySymbol)
+                    .map(([symbol, lev]) => {
+                      const requested = executionStatus.settings.leverage;
+                      const effective = Number(lev);
+                      const mismatch = Number.isFinite(effective) && effective !== requested;
+                      return mismatch
+                        ? `${symbol} ${formatNum(effective, 0)}x (req ${formatNum(requested, 0)}x)`
+                        : `${symbol} ${formatNum(effective, 0)}x`;
+                    })
+                    .join(' · ')}
+                </span>
+              ) : (
+                <span className="text-zinc-400">pending</span>
+              )}
+            </div>
             <button onClick={saveSettings} className="w-full px-3 py-2 bg-emerald-700 hover:bg-emerald-600 rounded text-xs font-semibold">Apply Settings</button>
           </div>
         </div>
