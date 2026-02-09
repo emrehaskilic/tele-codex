@@ -2,7 +2,7 @@ import { DecisionAction, GateResult, OrchestratorMetricsInput, SymbolState } fro
 
 export interface DecisionDependencies {
   expectedPrice: (symbol: string, side: 'BUY' | 'SELL', type: 'MARKET' | 'LIMIT', limitPrice?: number) => number | null;
-  getRiskPerTradePercent: () => number;
+  getInitialMarginUsdt: () => number;
   getMaxLeverage: () => number;
 }
 
@@ -46,7 +46,7 @@ export class DecisionEngine {
           const price = this.deps.expectedPrice(symbol, side, 'MARKET');
           if (price && price > 0) {
             const probeQuantity = this.computeProbeQuantity({
-              availableBalance: state.availableBalance,
+              initialMarginUsdt: this.deps.getInitialMarginUsdt(),
               expectedPrice: price,
               deltaZ,
               obiDeep,
@@ -54,6 +54,8 @@ export class DecisionEngine {
             });
 
             if (probeQuantity > 0) {
+              const targetMarginUsdt = this.deps.getInitialMarginUsdt();
+              const targetNotionalUsdt = targetMarginUsdt * this.deps.getMaxLeverage();
               actions.push({
                 type: 'ENTRY_PROBE',
                 symbol,
@@ -62,6 +64,8 @@ export class DecisionEngine {
                 quantity: probeQuantity,
                 reduceOnly: false,
                 expectedPrice: price,
+                targetMarginUsdt,
+                targetNotionalUsdt,
                 reason: 'entry_probe_liquidity_pressure_context',
               });
             }
@@ -102,13 +106,15 @@ export class DecisionEngine {
       const price = this.deps.expectedPrice(symbol, side, 'MARKET');
       if (price && price > 0) {
         const qty = this.computeProbeQuantity({
-          availableBalance: state.availableBalance,
+          initialMarginUsdt: this.deps.getInitialMarginUsdt(),
           expectedPrice: price,
           deltaZ,
           obiDeep,
           execPoor: state.execQuality.poor,
         });
         if (qty > 0) {
+          const targetMarginUsdt = this.deps.getInitialMarginUsdt();
+          const targetNotionalUsdt = targetMarginUsdt * this.deps.getMaxLeverage();
           actions.push({
             type: 'ADD_POSITION',
             symbol,
@@ -117,6 +123,8 @@ export class DecisionEngine {
             quantity: qty,
             reduceOnly: false,
             expectedPrice: price,
+            targetMarginUsdt,
+            targetNotionalUsdt,
             reason: 'scale_in_momentum',
           });
         }
@@ -145,18 +153,16 @@ export class DecisionEngine {
   }
 
   private computeProbeQuantity(input: {
-    availableBalance: number;
+    initialMarginUsdt: number;
     expectedPrice: number;
     deltaZ: number;
     obiDeep: number;
     execPoor: boolean;
   }): number {
-    const walletUsagePercent = this.deps.getRiskPerTradePercent(); // Actually walletUsagePercent from UI
     const leverage = this.deps.getMaxLeverage();
 
-    // Direct calculation: use walletUsagePercent of available balance with leverage
-    const usableBalance = (input.availableBalance * walletUsagePercent) / 100;
-    const notional = usableBalance * leverage;
+    const targetMargin = input.initialMarginUsdt;
+    const notional = targetMargin * leverage;
     const qty = notional / input.expectedPrice;
 
     if (!Number.isFinite(qty) || qty <= 0) {

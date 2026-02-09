@@ -36,9 +36,10 @@ export class Orchestrator {
   ) {
     this.decisionEngine = new DecisionEngine({
       expectedPrice: (symbol, side, type, limitPrice) => this.connector.expectedPrice(symbol, side, type, limitPrice),
-      getRiskPerTradePercent: () => this.capitalSettings.walletUsagePercent,
+      getInitialMarginUsdt: () => this.capitalSettings.initialBalanceUsdt,
       getMaxLeverage: () => this.capitalSettings.leverage,
     });
+    this.connector.setDefaultLeverage(this.capitalSettings.leverage);
 
     this.logger = new OrchestratorLogger({
       dir: path.resolve(__dirname, '../logs/orchestrator'),
@@ -254,7 +255,7 @@ export class Orchestrator {
         side: this.actors.get(primarySymbol)!.state.position!.side,
         size: this.actors.get(primarySymbol)!.state.position!.qty,
         entryPrice: this.actors.get(primarySymbol)!.state.position!.entryPrice,
-        leverage: this.capitalSettings.leverage,
+        leverage: connectorStatus.effectiveLeverageBySymbol?.[primarySymbol] ?? this.capitalSettings.leverage,
       } : null) : null,
       openPositions: selectedSymbols.reduce((acc, sym) => {
         const pos = this.actors.get(sym)?.state.position;
@@ -263,7 +264,7 @@ export class Orchestrator {
             side: pos.side,
             size: pos.qty,
             entryPrice: pos.entryPrice,
-            leverage: this.capitalSettings.leverage
+            leverage: connectorStatus.effectiveLeverageBySymbol?.[sym] ?? this.capitalSettings.leverage,
           };
         }
         return acc;
@@ -271,7 +272,7 @@ export class Orchestrator {
     };
   }
 
-  updateCapitalSettings(input: { initialBalanceUsdt?: number; walletUsagePercent?: number; leverage?: number }) {
+  async updateCapitalSettings(input: { initialBalanceUsdt?: number; walletUsagePercent?: number; leverage?: number }) {
     if (typeof input.initialBalanceUsdt === 'number' && Number.isFinite(input.initialBalanceUsdt) && input.initialBalanceUsdt >= 0) {
       this.capitalSettings.initialBalanceUsdt = input.initialBalanceUsdt;
     }
@@ -280,6 +281,11 @@ export class Orchestrator {
     }
     if (typeof input.leverage === 'number' && Number.isFinite(input.leverage) && input.leverage > 0) {
       this.capitalSettings.leverage = Math.min(input.leverage, this.config.maxLeverage);
+    }
+    this.connector.setDefaultLeverage(this.capitalSettings.leverage);
+    const connectorStatus = this.connector.getStatus();
+    if (connectorStatus.hasCredentials && connectorStatus.state === 'CONNECTED') {
+      await this.connector.ensureSymbolsReady();
     }
     return this.capitalSettings;
   }
@@ -519,7 +525,7 @@ export function createOrchestratorFromEnv(): Orchestrator {
     userDataWsBaseUrl: process.env.BINANCE_TESTNET_USER_WS_BASE || 'wss://stream.binancefuture.com',
     marketWsBaseUrl: process.env.BINANCE_TESTNET_MARKET_WS_BASE || 'wss://stream.binancefuture.com',
     recvWindowMs: Number(process.env.BINANCE_RECV_WINDOW_MS || 5000),
-    defaultMarginType: (String(process.env.DEFAULT_MARGIN_TYPE || 'ISOLATED').toUpperCase() === 'CROSSED' ? 'CROSSED' : 'ISOLATED'),
+    defaultMarginType: (String(process.env.DEFAULT_MARGIN_TYPE || 'CROSSED').toUpperCase() === 'CROSSED' ? 'CROSSED' : 'ISOLATED'),
     defaultLeverage: Number(process.env.DEFAULT_SYMBOL_LEVERAGE || 20),
     dualSidePosition: String(process.env.POSITION_MODE || 'ONE-WAY').toUpperCase() === 'HEDGE',
   });
